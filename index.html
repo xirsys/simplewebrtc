@@ -64,16 +64,16 @@
                 async: false
             });
             
-            // grab the room from the URL
+            // Grab the room from the URL
             var room = location.search && location.search.split('?')[1];
 
-            // create our webrtc connection
+            // Create our WebRTC connection
             var webrtc = new SimpleWebRTC({
-                // the id/element dom element that will hold "our" video
+                // The DOM element that will hold "our" video
                 localVideoEl: 'localVideo',
-                // the id/element dom element that will hold remote videos
+                // The DOM element that will hold remote videos
                 remoteVideosEl: '',
-                // immediately ask for camera access
+                // Immediately ask for camera access
                 autoRequestMedia: true,
                 debug: false,
                 detectSpeakingEvents: true,
