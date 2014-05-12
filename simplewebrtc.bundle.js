@@ -1,607 +1,4 @@
-(function(e){if("function"==typeof bootstrap)bootstrap("simplewebrtc",e);else if("object"==typeof exports)module.exports=e();else if("function"==typeof define&&define.amd)define(e);else if("undefined"!=typeof ses){if(!ses.ok())return;ses.makeSimpleWebRTC=e}else"undefined"!=typeof window?window.SimpleWebRTC=e():global.SimpleWebRTC=e()})(function(){var define,ses,bootstrap,module,exports;
-return (function(e,t,n){function i(n,s){if(!t[n]){if(!e[n]){var o=typeof require=="function"&&require;if(!s&&o)return o(n,!0);if(r)return r(n,!0);throw new Error("Cannot find module '"+n+"'")}var u=t[n]={exports:{}};e[n][0].call(u.exports,function(t){var r=e[n][1][t];return i(r?r:t)},u,u.exports)}return t[n].exports}var r=typeof require=="function"&&require;for(var s=0;s<n.length;s++)i(n[s]);return i})({1:[function(require,module,exports){
-var WebRTC = require('webrtc');
-var WildEmitter = require('wildemitter');
-var webrtcSupport = require('webrtcsupport');
-var attachMediaStream = require('attachmediastream');
-var getScreenMedia = require('getscreenmedia');
-var mockconsole = require('mockconsole');
-var io = require('socket.io-client');
-
-
-function SimpleWebRTC(opts) {
-    var self = this;
-    var options = opts || {};
-    var config = this.config = {
-            url: 'http://signaling.simplewebrtc.com:8888',
-            debug: false,
-            localVideoEl: '',
-            remoteVideosEl: '',
-            enableDataChannels: true,
-            autoRequestMedia: false,
-            autoRemoveVideos: true,
-            adjustPeerVolume: true,
-            peerVolumeWhenSpeaking: 0.25,
-            media: {
-                video: true,
-                audio: true
-            }
-        };
-    var item, connection;
-
-    // We also allow a 'logger' option. It can be any object that implements
-    // log, warn, and error methods.
-    // We log nothing by default, following "the rule of silence":
-    // http://www.linfo.org/rule_of_silence.html
-    this.logger = function () {
-        // we assume that if you're in debug mode and you didn't
-        // pass in a logger, you actually want to log as much as
-        // possible.
-        if (opts.debug) {
-            return opts.logger || console;
-        } else {
-        // or we'll use your logger which should have its own logic
-        // for output. Or we'll return the no-op.
-            return opts.logger || mockconsole;
-        }
-    }();
-
-    // set our config from options
-    for (item in options) {
-        this.config[item] = options[item];
-    }
-
-    // attach detected support for convenience
-    this.capabilities = webrtcSupport;
-
-    // call WildEmitter constructor
-    WildEmitter.call(this);
-
-    // our socket.io connection
-    connection = this.connection = io.connect(this.config.url);
-
-    connection.on('connect', function () {
-        self.emit('connectionReady', connection.socket.sessionid);
-        self.sessionReady = true;
-        self.testReadiness();
-    });
-
-    connection.on('message', function (message) {
-        var peers = self.webrtc.getPeers(message.from, message.roomType);
-        var peer;
-
-        if (message.type === 'offer') {
-            if (peers.length) {
-                peer = peers[0];
-            } else {
-                peer = self.webrtc.createPeer({
-                    id: message.from,
-                    type: message.roomType,
-                    enableDataChannels: self.config.enableDataChannels && message.roomType !== 'screen',
-                    sharemyscreen: message.roomType === 'screen' && !message.broadcaster,
-                    broadcaster: message.roomType === 'screen' && !message.broadcaster ? self.connection.socket.sessionid : null
-                });
-            }
-            peer.handleMessage(message);
-        } else if (peers.length) {
-            peers.forEach(function (peer) {
-                peer.handleMessage(message);
-            });
-        }
-    });
-
-    connection.on('remove', function (room) {
-        if (room.id !== self.connection.socket.sessionid) {
-            self.webrtc.removePeers(room.id, room.type);
-        }
-    });
-
-    // instantiate our main WebRTC helper
-    // using same logger from logic here
-    opts.logger = this.logger;
-    opts.debug = false;
-    this.webrtc = new WebRTC(opts);
-
-    // attach a few methods from underlying lib to simple.
-    ['mute', 'unmute', 'pauseVideo', 'resumeVideo', 'pause', 'resume', 'sendToAll', 'sendDirectlyToAll'].forEach(function (method) {
-        self[method] = self.webrtc[method].bind(self.webrtc);
-    });
-
-    // proxy events from WebRTC
-    this.webrtc.on('*', function () {
-        self.emit.apply(self, arguments);
-    });
-
-    // log all events in debug mode
-    if (config.debug) {
-        this.on('*', this.logger.log.bind(this.logger, 'SimpleWebRTC event:'));
-    }
-
-    // check for readiness
-    this.webrtc.on('localStream', function () {
-        self.testReadiness();
-    });
-
-    this.webrtc.on('message', function (payload) {
-        self.connection.emit('message', payload);
-    });
-
-    this.webrtc.on('peerStreamAdded', this.handlePeerStreamAdded.bind(this));
-    this.webrtc.on('peerStreamRemoved', this.handlePeerStreamRemoved.bind(this));
-
-    // echo cancellation attempts
-    if (this.config.adjustPeerVolume) {
-        this.webrtc.on('speaking', this.setVolumeForAll.bind(this, this.config.peerVolumeWhenSpeaking));
-        this.webrtc.on('stoppedSpeaking', this.setVolumeForAll.bind(this, 1));
-    }
-
-    connection.on('stunservers', function (args) {
-        // resets/overrides the config
-        self.webrtc.config.peerConnectionConfig.iceServers = args;
-        self.emit('stunservers', args);
-    });
-    connection.on('turnservers', function (args) {
-        // appends to the config
-        self.webrtc.config.peerConnectionConfig.iceServers = self.webrtc.config.peerConnectionConfig.iceServers.concat(args);
-        self.emit('turnservers', args);
-    });
-
-    // sending mute/unmute to all peers
-    this.webrtc.on('audioOn', function () {
-        self.webrtc.sendToAll('unmute', {name: 'audio'});
-    });
-    this.webrtc.on('audioOff', function () {
-        self.webrtc.sendToAll('mute', {name: 'audio'});
-    });
-    this.webrtc.on('videoOn', function () {
-        self.webrtc.sendToAll('unmute', {name: 'video'});
-    });
-    this.webrtc.on('videoOff', function () {
-        self.webrtc.sendToAll('mute', {name: 'video'});
-    });
-
-    if (this.config.autoRequestMedia) this.startLocalVideo();
-}
-
-
-SimpleWebRTC.prototype = Object.create(WildEmitter.prototype, {
-    constructor: {
-        value: SimpleWebRTC
-    }
-});
-
-SimpleWebRTC.prototype.leaveRoom = function () {
-    if (this.roomName) {
-        this.connection.emit('leave');
-        this.webrtc.peers.forEach(function (peer) {
-            peer.end();
-        });
-        if (this.getLocalScreen()) {
-            this.stopScreenShare();
-        }
-        this.emit('leftRoom', this.roomName);
-        this.roomName = undefined;
-    }
-};
-
-SimpleWebRTC.prototype.handlePeerStreamAdded = function (peer) {
-    var self = this;
-    var container = this.getRemoteVideoContainer();
-    var video = attachMediaStream(peer.stream);
-
-    // store video element as part of peer for easy removal
-    peer.videoEl = video;
-    video.id = this.getDomId(peer);
-
-    if (container) container.appendChild(video);
-
-    this.emit('videoAdded', video, peer);
-
-    // send our mute status to new peer if we're muted
-    // currently called with a small delay because it arrives before
-    // the video element is created otherwise (which happens after
-    // the async setRemoteDescription-createAnswer)
-    window.setTimeout(function () {
-        var muted = false;
-        self.webrtc.localStream.getAudioTracks().forEach(function (track) {
-            muted = !track.enabled;
-        });
-        if (muted) {
-            peer.send('mute', {name: 'audio'});
-        }
-
-        muted = false;
-        self.webrtc.localStream.getVideoTracks().forEach(function (track) {
-            muted = !track.enabled;
-        });
-        if (muted) {
-            peer.send('mute', {name: 'video'});
-        }
-    }, 250);
-};
-
-SimpleWebRTC.prototype.handlePeerStreamRemoved = function (peer) {
-    var container = this.getRemoteVideoContainer();
-    var videoEl = peer.videoEl;
-    if (this.config.autoRemoveVideos && container && videoEl) {
-        container.removeChild(videoEl);
-    }
-    if (videoEl) this.emit('videoRemoved', videoEl, peer);
-};
-
-SimpleWebRTC.prototype.getDomId = function (peer) {
-    return [peer.id, peer.type, peer.broadcaster ? 'broadcasting' : 'incoming'].join('_');
-};
-
-// set volume on video tag for all peers takse a value between 0 and 1
-SimpleWebRTC.prototype.setVolumeForAll = function (volume) {
-    this.webrtc.peers.forEach(function (peer) {
-        if (peer.videoEl) peer.videoEl.volume = volume;
-    });
-};
-
-SimpleWebRTC.prototype.joinRoom = function (name, cb) {
-    var self = this;
-    this.roomName = name;
-    this.connection.emit('join', name, function (err, roomDescription) {
-        if (err) {
-            self.emit('error', err);
-        } else {
-            var id,
-                client,
-                type,
-                peer;
-            for (id in roomDescription.clients) {
-                client = roomDescription.clients[id];
-                for (type in client) {
-                    if (client[type]) {
-                        peer = self.webrtc.createPeer({
-                            id: id,
-                            type: type,
-                            enableDataChannels: self.config.enableDataChannels && type !== 'screen',
-                            receiveMedia: {
-                                mandatory: {
-                                    OfferToReceiveAudio: type !== 'screen',
-                                    OfferToReceiveVideo: true
-                                }
-                            }
-                        });
-                        peer.start();
-                    }
-                }
-            }
-        }
-
-        if (cb) cb(err, roomDescription);
-        self.emit('joinedRoom', name);
-    });
-};
-
-SimpleWebRTC.prototype.getEl = function (idOrEl) {
-    if (typeof idOrEl === 'string') {
-        return document.getElementById(idOrEl);
-    } else {
-        return idOrEl;
-    }
-};
-
-SimpleWebRTC.prototype.startLocalVideo = function () {
-    var self = this;
-    this.webrtc.startLocalMedia(this.config.media, function (err, stream) {
-        if (err) {
-            self.emit('localMediaError', err);
-        } else {
-            attachMediaStream(stream, self.getLocalVideoContainer(), {muted: true, mirror: true});
-        }
-    });
-};
-
-SimpleWebRTC.prototype.stopLocalVideo = function () {
-    this.webrtc.stopLocalMedia();
-};
-
-// this accepts either element ID or element
-// and either the video tag itself or a container
-// that will be used to put the video tag into.
-SimpleWebRTC.prototype.getLocalVideoContainer = function () {
-    var el = this.getEl(this.config.localVideoEl);
-    if (el && el.tagName === 'VIDEO') {
-        el.oncontextmenu = function () { return false; };
-        return el;
-    } else if (el) {
-        var video = document.createElement('video');
-        video.oncontextmenu = function () { return false; };
-        el.appendChild(video);
-        return video;
-    } else {
-        return;
-    }
-};
-
-SimpleWebRTC.prototype.getRemoteVideoContainer = function () {
-    return this.getEl(this.config.remoteVideosEl);
-};
-
-SimpleWebRTC.prototype.shareScreen = function (cb) {
-    var self = this,
-        peer;
-    getScreenMedia(function (err, stream) {
-        var item,
-            el = document.createElement('video'),
-            container = self.getRemoteVideoContainer();
-
-        el.oncontextmenu = function () { return false; };
-        if (!err) {
-            self.webrtc.localScreen = stream;
-            el.id = 'localScreen';
-            attachMediaStream(stream, el);
-            if (container) {
-                container.appendChild(el);
-            }
-
-            // TODO: might need to migrate to the video tracks onended
-            stream.onended = function () {
-                self.emit('localScreenRemoved', el);
-                self.stopScreenShare();
-            };
-
-            self.emit('localScreenAdded', el);
-            self.connection.emit('shareScreen');
-            self.webrtc.peers.forEach(function (existingPeer) {
-                var peer;
-                if (existingPeer.type === 'video') {
-                    peer = self.webrtc.createPeer({
-                        id: existingPeer.id,
-                        type: 'screen',
-                        sharemyscreen: true,
-                        enableDataChannels: false,
-                        receiveMedia: {
-                            mandatory: {
-                                OfferToReceiveAudio: false,
-                                OfferToReceiveVideo: false
-                            }
-                        },
-                        broadcaster: self.connection.socket.sessionid,
-                    });
-                    peer.start();
-                }
-            });
-        } else {
-            err.media = 'screen';
-            self.emit('localMediaError', err);
-        }
-
-        // enable the callback
-        if (cb) cb(err, stream);
-    });
-};
-
-SimpleWebRTC.prototype.getLocalScreen = function () {
-    return this.webrtc.localScreen;
-};
-
-SimpleWebRTC.prototype.stopScreenShare = function () {
-    this.connection.emit('unshareScreen');
-    var videoEl = document.getElementById('localScreen');
-    var container = this.getRemoteVideoContainer();
-    var stream = this.getLocalScreen();
-
-    if (this.config.autoRemoveVideos && container && videoEl) {
-        container.removeChild(videoEl);
-    }
-
-    // a hack to emit the event the removes the video
-    // element that we want
-    if (videoEl) this.emit('videoRemoved', videoEl);
-    if (stream) stream.stop();
-    this.webrtc.peers.forEach(function (peer) {
-        if (peer.broadcaster) {
-            peer.end();
-        }
-    });
-    delete this.webrtc.localScreen;
-};
-
-SimpleWebRTC.prototype.testReadiness = function () {
-    var self = this;
-    if (this.webrtc.localStream && this.sessionReady) {
-        self.emit('readyToCall', self.connection.socket.sessionid);
-    }
-};
-
-SimpleWebRTC.prototype.createRoom = function (name, cb) {
-    if (arguments.length === 2) {
-        this.connection.emit('create', name, cb);
-    } else {
-        this.connection.emit('create', name);
-    }
-};
-
-SimpleWebRTC.prototype.sendFile = function () {
-    if (!webrtcSupport.dataChannel) {
-        return this.emit('error', new Error('DataChannelNotSupported'));
-    }
-
-};
-
-module.exports = SimpleWebRTC;
-
-},{"attachmediastream":5,"getscreenmedia":6,"mockconsole":7,"socket.io-client":8,"webrtc":2,"webrtcsupport":4,"wildemitter":3}],4:[function(require,module,exports){
-// created by @HenrikJoreteg
-var prefix;
-var isChrome = false;
-var isFirefox = false;
-var ua = window.navigator.userAgent.toLowerCase();
-
-// basic sniffing
-if (ua.indexOf('firefox') !== -1) {
-    prefix = 'moz';
-    isFirefox = true;
-} else if (ua.indexOf('chrome') !== -1) {
-    prefix = 'webkit';
-    isChrome = true;
-}
-
-var PC = window.mozRTCPeerConnection || window.webkitRTCPeerConnection;
-var IceCandidate = window.mozRTCIceCandidate || window.RTCIceCandidate;
-var SessionDescription = window.mozRTCSessionDescription || window.RTCSessionDescription;
-var MediaStream = window.webkitMediaStream || window.MediaStream;
-var screenSharing = window.location.protocol === 'https:' && window.navigator.userAgent.match('Chrome') && parseInt(window.navigator.userAgent.match(/Chrome\/(.*) /)[1], 10) >= 26;
-var AudioContext = window.webkitAudioContext || window.AudioContext;
-
-
-// export support flags and constructors.prototype && PC
-module.exports = {
-    support: !!PC,
-    dataChannel: isChrome || isFirefox || (PC && PC.prototype && PC.prototype.createDataChannel),
-    prefix: prefix,
-    webAudio: !!(AudioContext && AudioContext.prototype.createMediaStreamSource),
-    mediaStream: !!(MediaStream && MediaStream.prototype.removeTrack),
-    screenSharing: !!screenSharing,
-    AudioContext: AudioContext,
-    PeerConnection: PC,
-    SessionDescription: SessionDescription,
-    IceCandidate: IceCandidate
-};
-
-},{}],3:[function(require,module,exports){
-/*
-WildEmitter.js is a slim little event emitter by @henrikjoreteg largely based 
-on @visionmedia's Emitter from UI Kit.
-
-Why? I wanted it standalone.
-
-I also wanted support for wildcard emitters like this:
-
-emitter.on('*', function (eventName, other, event, payloads) {
-    
-});
-
-emitter.on('somenamespace*', function (eventName, payloads) {
-    
-});
-
-Please note that callbacks triggered by wildcard registered events also get 
-the event name as the first argument.
-*/
-module.exports = WildEmitter;
-
-function WildEmitter() {
-    this.callbacks = {};
-}
-
-// Listen on the given `event` with `fn`. Store a group name if present.
-WildEmitter.prototype.on = function (event, groupName, fn) {
-    var hasGroup = (arguments.length === 3),
-        group = hasGroup ? arguments[1] : undefined, 
-        func = hasGroup ? arguments[2] : arguments[1];
-    func._groupName = group;
-    (this.callbacks[event] = this.callbacks[event] || []).push(func);
-    return this;
-};
-
-// Adds an `event` listener that will be invoked a single
-// time then automatically removed.
-WildEmitter.prototype.once = function (event, groupName, fn) {
-    var self = this,
-        hasGroup = (arguments.length === 3),
-        group = hasGroup ? arguments[1] : undefined, 
-        func = hasGroup ? arguments[2] : arguments[1];
-    function on() {
-        self.off(event, on);
-        func.apply(this, arguments);
-    }
-    this.on(event, group, on);
-    return this;
-};
-
-// Unbinds an entire group
-WildEmitter.prototype.releaseGroup = function (groupName) {
-    var item, i, len, handlers;
-    for (item in this.callbacks) {
-        handlers = this.callbacks[item];
-        for (i = 0, len = handlers.length; i < len; i++) {
-            if (handlers[i]._groupName === groupName) {
-                //console.log('removing');
-                // remove it and shorten the array we're looping through
-                handlers.splice(i, 1);
-                i--;
-                len--;
-            }
-        }
-    }
-    return this;
-};
-
-// Remove the given callback for `event` or all
-// registered callbacks.
-WildEmitter.prototype.off = function (event, fn) {
-    var callbacks = this.callbacks[event],
-        i;
-    
-    if (!callbacks) return this;
-
-    // remove all handlers
-    if (arguments.length === 1) {
-        delete this.callbacks[event];
-        return this;
-    }
-
-    // remove specific handler
-    i = callbacks.indexOf(fn);
-    callbacks.splice(i, 1);
-    return this;
-};
-
-// Emit `event` with the given args.
-// also calls any `*` handlers
-WildEmitter.prototype.emit = function (event) {
-    var args = [].slice.call(arguments, 1),
-        callbacks = this.callbacks[event],
-        specialCallbacks = this.getWildcardCallbacks(event),
-        i,
-        len,
-        item;
-
-    if (callbacks) {
-        for (i = 0, len = callbacks.length; i < len; ++i) {
-            if (callbacks[i]) {
-                callbacks[i].apply(this, args);
-            } else {
-                break;
-            }
-        }
-    }
-
-    if (specialCallbacks) {
-        for (i = 0, len = specialCallbacks.length; i < len; ++i) {
-            if (specialCallbacks[i]) {
-                specialCallbacks[i].apply(this, [event].concat(args));
-            } else {
-                break;
-            }
-        }
-    }
-
-    return this;
-};
-
-// Helper for for finding special wildcard event handlers that match the event
-WildEmitter.prototype.getWildcardCallbacks = function (eventName) {
-    var item,
-        split,
-        result = [];
-
-    for (item in this.callbacks) {
-        split = item.split('*');
-        if (item === '*' || (split.length === 2 && eventName.slice(0, split[1].length) === split[1])) {
-            result = result.concat(this.callbacks[item]);
-        }
-    }
-    return result;
-};
-
-},{}],5:[function(require,module,exports){
+!function(e){if("object"==typeof exports&&"undefined"!=typeof module)module.exports=e();else if("function"==typeof define&&define.amd)define([],e);else{var f;"undefined"!=typeof window?f=window:"undefined"!=typeof global?f=global:"undefined"!=typeof self&&(f=self),f.SimpleWebRTC=e()}}(function(){var define,module,exports;return (function e(t,n,r){function s(o,u){if(!n[o]){if(!t[o]){var a=typeof require=="function"&&require;if(!u&&a)return a(o,!0);if(i)return i(o,!0);throw new Error("Cannot find module '"+o+"'")}var f=n[o]={exports:{}};t[o][0].call(f.exports,function(e){var n=t[o][1][e];return s(n?n:e)},f,f.exports,e,t,n,r)}return n[o].exports}var i=typeof require=="function"&&require;for(var o=0;o<r.length;o++)s(r[o]);return s})({1:[function(_dereq_,module,exports){
 module.exports = function (stream, el, options) {
     var URL = window.URL;
     var opts = {
@@ -642,7 +39,836 @@ module.exports = function (stream, el, options) {
     return element;
 };
 
-},{}],7:[function(require,module,exports){
+},{}],2:[function(_dereq_,module,exports){
+if (typeof Object.create === 'function') {
+  // implementation from standard node.js 'util' module
+  module.exports = function inherits(ctor, superCtor) {
+    ctor.super_ = superCtor
+    ctor.prototype = Object.create(superCtor.prototype, {
+      constructor: {
+        value: ctor,
+        enumerable: false,
+        writable: true,
+        configurable: true
+      }
+    });
+  };
+} else {
+  // old school shim for old browsers
+  module.exports = function inherits(ctor, superCtor) {
+    ctor.super_ = superCtor
+    var TempCtor = function () {}
+    TempCtor.prototype = superCtor.prototype
+    ctor.prototype = new TempCtor()
+    ctor.prototype.constructor = ctor
+  }
+}
+
+},{}],3:[function(_dereq_,module,exports){
+// shim for using process in browser
+
+var process = module.exports = {};
+
+process.nextTick = (function () {
+    var canSetImmediate = typeof window !== 'undefined'
+    && window.setImmediate;
+    var canPost = typeof window !== 'undefined'
+    && window.postMessage && window.addEventListener
+    ;
+
+    if (canSetImmediate) {
+        return function (f) { return window.setImmediate(f) };
+    }
+
+    if (canPost) {
+        var queue = [];
+        window.addEventListener('message', function (ev) {
+            var source = ev.source;
+            if ((source === window || source === null) && ev.data === 'process-tick') {
+                ev.stopPropagation();
+                if (queue.length > 0) {
+                    var fn = queue.shift();
+                    fn();
+                }
+            }
+        }, true);
+
+        return function nextTick(fn) {
+            queue.push(fn);
+            window.postMessage('process-tick', '*');
+        };
+    }
+
+    return function nextTick(fn) {
+        setTimeout(fn, 0);
+    };
+})();
+
+process.title = 'browser';
+process.browser = true;
+process.env = {};
+process.argv = [];
+
+function noop() {}
+
+process.on = noop;
+process.addListener = noop;
+process.once = noop;
+process.off = noop;
+process.removeListener = noop;
+process.removeAllListeners = noop;
+process.emit = noop;
+
+process.binding = function (name) {
+    throw new Error('process.binding is not supported');
+}
+
+// TODO(shtylman)
+process.cwd = function () { return '/' };
+process.chdir = function (dir) {
+    throw new Error('process.chdir is not supported');
+};
+
+},{}],4:[function(_dereq_,module,exports){
+module.exports = function isBuffer(arg) {
+  return arg && typeof arg === 'object'
+    && typeof arg.copy === 'function'
+    && typeof arg.fill === 'function'
+    && typeof arg.readUInt8 === 'function';
+}
+},{}],5:[function(_dereq_,module,exports){
+(function (process,global){
+// Copyright Joyent, Inc. and other Node contributors.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a
+// copy of this software and associated documentation files (the
+// "Software"), to deal in the Software without restriction, including
+// without limitation the rights to use, copy, modify, merge, publish,
+// distribute, sublicense, and/or sell copies of the Software, and to permit
+// persons to whom the Software is furnished to do so, subject to the
+// following conditions:
+//
+// The above copyright notice and this permission notice shall be included
+// in all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN
+// NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
+// DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+// OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
+// USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+var formatRegExp = /%[sdj%]/g;
+exports.format = function(f) {
+  if (!isString(f)) {
+    var objects = [];
+    for (var i = 0; i < arguments.length; i++) {
+      objects.push(inspect(arguments[i]));
+    }
+    return objects.join(' ');
+  }
+
+  var i = 1;
+  var args = arguments;
+  var len = args.length;
+  var str = String(f).replace(formatRegExp, function(x) {
+    if (x === '%%') return '%';
+    if (i >= len) return x;
+    switch (x) {
+      case '%s': return String(args[i++]);
+      case '%d': return Number(args[i++]);
+      case '%j':
+        try {
+          return JSON.stringify(args[i++]);
+        } catch (_) {
+          return '[Circular]';
+        }
+      default:
+        return x;
+    }
+  });
+  for (var x = args[i]; i < len; x = args[++i]) {
+    if (isNull(x) || !isObject(x)) {
+      str += ' ' + x;
+    } else {
+      str += ' ' + inspect(x);
+    }
+  }
+  return str;
+};
+
+
+// Mark that a method should not be used.
+// Returns a modified function which warns once by default.
+// If --no-deprecation is set, then it is a no-op.
+exports.deprecate = function(fn, msg) {
+  // Allow for deprecating things in the process of starting up.
+  if (isUndefined(global.process)) {
+    return function() {
+      return exports.deprecate(fn, msg).apply(this, arguments);
+    };
+  }
+
+  if (process.noDeprecation === true) {
+    return fn;
+  }
+
+  var warned = false;
+  function deprecated() {
+    if (!warned) {
+      if (process.throwDeprecation) {
+        throw new Error(msg);
+      } else if (process.traceDeprecation) {
+        console.trace(msg);
+      } else {
+        console.error(msg);
+      }
+      warned = true;
+    }
+    return fn.apply(this, arguments);
+  }
+
+  return deprecated;
+};
+
+
+var debugs = {};
+var debugEnviron;
+exports.debuglog = function(set) {
+  if (isUndefined(debugEnviron))
+    debugEnviron = process.env.NODE_DEBUG || '';
+  set = set.toUpperCase();
+  if (!debugs[set]) {
+    if (new RegExp('\\b' + set + '\\b', 'i').test(debugEnviron)) {
+      var pid = process.pid;
+      debugs[set] = function() {
+        var msg = exports.format.apply(exports, arguments);
+        console.error('%s %d: %s', set, pid, msg);
+      };
+    } else {
+      debugs[set] = function() {};
+    }
+  }
+  return debugs[set];
+};
+
+
+/**
+ * Echos the value of a value. Trys to print the value out
+ * in the best way possible given the different types.
+ *
+ * @param {Object} obj The object to print out.
+ * @param {Object} opts Optional options object that alters the output.
+ */
+/* legacy: obj, showHidden, depth, colors*/
+function inspect(obj, opts) {
+  // default options
+  var ctx = {
+    seen: [],
+    stylize: stylizeNoColor
+  };
+  // legacy...
+  if (arguments.length >= 3) ctx.depth = arguments[2];
+  if (arguments.length >= 4) ctx.colors = arguments[3];
+  if (isBoolean(opts)) {
+    // legacy...
+    ctx.showHidden = opts;
+  } else if (opts) {
+    // got an "options" object
+    exports._extend(ctx, opts);
+  }
+  // set default options
+  if (isUndefined(ctx.showHidden)) ctx.showHidden = false;
+  if (isUndefined(ctx.depth)) ctx.depth = 2;
+  if (isUndefined(ctx.colors)) ctx.colors = false;
+  if (isUndefined(ctx.customInspect)) ctx.customInspect = true;
+  if (ctx.colors) ctx.stylize = stylizeWithColor;
+  return formatValue(ctx, obj, ctx.depth);
+}
+exports.inspect = inspect;
+
+
+// http://en.wikipedia.org/wiki/ANSI_escape_code#graphics
+inspect.colors = {
+  'bold' : [1, 22],
+  'italic' : [3, 23],
+  'underline' : [4, 24],
+  'inverse' : [7, 27],
+  'white' : [37, 39],
+  'grey' : [90, 39],
+  'black' : [30, 39],
+  'blue' : [34, 39],
+  'cyan' : [36, 39],
+  'green' : [32, 39],
+  'magenta' : [35, 39],
+  'red' : [31, 39],
+  'yellow' : [33, 39]
+};
+
+// Don't use 'blue' not visible on cmd.exe
+inspect.styles = {
+  'special': 'cyan',
+  'number': 'yellow',
+  'boolean': 'yellow',
+  'undefined': 'grey',
+  'null': 'bold',
+  'string': 'green',
+  'date': 'magenta',
+  // "name": intentionally not styling
+  'regexp': 'red'
+};
+
+
+function stylizeWithColor(str, styleType) {
+  var style = inspect.styles[styleType];
+
+  if (style) {
+    return '\u001b[' + inspect.colors[style][0] + 'm' + str +
+           '\u001b[' + inspect.colors[style][1] + 'm';
+  } else {
+    return str;
+  }
+}
+
+
+function stylizeNoColor(str, styleType) {
+  return str;
+}
+
+
+function arrayToHash(array) {
+  var hash = {};
+
+  array.forEach(function(val, idx) {
+    hash[val] = true;
+  });
+
+  return hash;
+}
+
+
+function formatValue(ctx, value, recurseTimes) {
+  // Provide a hook for user-specified inspect functions.
+  // Check that value is an object with an inspect function on it
+  if (ctx.customInspect &&
+      value &&
+      isFunction(value.inspect) &&
+      // Filter out the util module, it's inspect function is special
+      value.inspect !== exports.inspect &&
+      // Also filter out any prototype objects using the circular check.
+      !(value.constructor && value.constructor.prototype === value)) {
+    var ret = value.inspect(recurseTimes, ctx);
+    if (!isString(ret)) {
+      ret = formatValue(ctx, ret, recurseTimes);
+    }
+    return ret;
+  }
+
+  // Primitive types cannot have properties
+  var primitive = formatPrimitive(ctx, value);
+  if (primitive) {
+    return primitive;
+  }
+
+  // Look up the keys of the object.
+  var keys = Object.keys(value);
+  var visibleKeys = arrayToHash(keys);
+
+  if (ctx.showHidden) {
+    keys = Object.getOwnPropertyNames(value);
+  }
+
+  // IE doesn't make error fields non-enumerable
+  // http://msdn.microsoft.com/en-us/library/ie/dww52sbt(v=vs.94).aspx
+  if (isError(value)
+      && (keys.indexOf('message') >= 0 || keys.indexOf('description') >= 0)) {
+    return formatError(value);
+  }
+
+  // Some type of object without properties can be shortcutted.
+  if (keys.length === 0) {
+    if (isFunction(value)) {
+      var name = value.name ? ': ' + value.name : '';
+      return ctx.stylize('[Function' + name + ']', 'special');
+    }
+    if (isRegExp(value)) {
+      return ctx.stylize(RegExp.prototype.toString.call(value), 'regexp');
+    }
+    if (isDate(value)) {
+      return ctx.stylize(Date.prototype.toString.call(value), 'date');
+    }
+    if (isError(value)) {
+      return formatError(value);
+    }
+  }
+
+  var base = '', array = false, braces = ['{', '}'];
+
+  // Make Array say that they are Array
+  if (isArray(value)) {
+    array = true;
+    braces = ['[', ']'];
+  }
+
+  // Make functions say that they are functions
+  if (isFunction(value)) {
+    var n = value.name ? ': ' + value.name : '';
+    base = ' [Function' + n + ']';
+  }
+
+  // Make RegExps say that they are RegExps
+  if (isRegExp(value)) {
+    base = ' ' + RegExp.prototype.toString.call(value);
+  }
+
+  // Make dates with properties first say the date
+  if (isDate(value)) {
+    base = ' ' + Date.prototype.toUTCString.call(value);
+  }
+
+  // Make error with message first say the error
+  if (isError(value)) {
+    base = ' ' + formatError(value);
+  }
+
+  if (keys.length === 0 && (!array || value.length == 0)) {
+    return braces[0] + base + braces[1];
+  }
+
+  if (recurseTimes < 0) {
+    if (isRegExp(value)) {
+      return ctx.stylize(RegExp.prototype.toString.call(value), 'regexp');
+    } else {
+      return ctx.stylize('[Object]', 'special');
+    }
+  }
+
+  ctx.seen.push(value);
+
+  var output;
+  if (array) {
+    output = formatArray(ctx, value, recurseTimes, visibleKeys, keys);
+  } else {
+    output = keys.map(function(key) {
+      return formatProperty(ctx, value, recurseTimes, visibleKeys, key, array);
+    });
+  }
+
+  ctx.seen.pop();
+
+  return reduceToSingleString(output, base, braces);
+}
+
+
+function formatPrimitive(ctx, value) {
+  if (isUndefined(value))
+    return ctx.stylize('undefined', 'undefined');
+  if (isString(value)) {
+    var simple = '\'' + JSON.stringify(value).replace(/^"|"$/g, '')
+                                             .replace(/'/g, "\\'")
+                                             .replace(/\\"/g, '"') + '\'';
+    return ctx.stylize(simple, 'string');
+  }
+  if (isNumber(value))
+    return ctx.stylize('' + value, 'number');
+  if (isBoolean(value))
+    return ctx.stylize('' + value, 'boolean');
+  // For some reason typeof null is "object", so special case here.
+  if (isNull(value))
+    return ctx.stylize('null', 'null');
+}
+
+
+function formatError(value) {
+  return '[' + Error.prototype.toString.call(value) + ']';
+}
+
+
+function formatArray(ctx, value, recurseTimes, visibleKeys, keys) {
+  var output = [];
+  for (var i = 0, l = value.length; i < l; ++i) {
+    if (hasOwnProperty(value, String(i))) {
+      output.push(formatProperty(ctx, value, recurseTimes, visibleKeys,
+          String(i), true));
+    } else {
+      output.push('');
+    }
+  }
+  keys.forEach(function(key) {
+    if (!key.match(/^\d+$/)) {
+      output.push(formatProperty(ctx, value, recurseTimes, visibleKeys,
+          key, true));
+    }
+  });
+  return output;
+}
+
+
+function formatProperty(ctx, value, recurseTimes, visibleKeys, key, array) {
+  var name, str, desc;
+  desc = Object.getOwnPropertyDescriptor(value, key) || { value: value[key] };
+  if (desc.get) {
+    if (desc.set) {
+      str = ctx.stylize('[Getter/Setter]', 'special');
+    } else {
+      str = ctx.stylize('[Getter]', 'special');
+    }
+  } else {
+    if (desc.set) {
+      str = ctx.stylize('[Setter]', 'special');
+    }
+  }
+  if (!hasOwnProperty(visibleKeys, key)) {
+    name = '[' + key + ']';
+  }
+  if (!str) {
+    if (ctx.seen.indexOf(desc.value) < 0) {
+      if (isNull(recurseTimes)) {
+        str = formatValue(ctx, desc.value, null);
+      } else {
+        str = formatValue(ctx, desc.value, recurseTimes - 1);
+      }
+      if (str.indexOf('\n') > -1) {
+        if (array) {
+          str = str.split('\n').map(function(line) {
+            return '  ' + line;
+          }).join('\n').substr(2);
+        } else {
+          str = '\n' + str.split('\n').map(function(line) {
+            return '   ' + line;
+          }).join('\n');
+        }
+      }
+    } else {
+      str = ctx.stylize('[Circular]', 'special');
+    }
+  }
+  if (isUndefined(name)) {
+    if (array && key.match(/^\d+$/)) {
+      return str;
+    }
+    name = JSON.stringify('' + key);
+    if (name.match(/^"([a-zA-Z_][a-zA-Z_0-9]*)"$/)) {
+      name = name.substr(1, name.length - 2);
+      name = ctx.stylize(name, 'name');
+    } else {
+      name = name.replace(/'/g, "\\'")
+                 .replace(/\\"/g, '"')
+                 .replace(/(^"|"$)/g, "'");
+      name = ctx.stylize(name, 'string');
+    }
+  }
+
+  return name + ': ' + str;
+}
+
+
+function reduceToSingleString(output, base, braces) {
+  var numLinesEst = 0;
+  var length = output.reduce(function(prev, cur) {
+    numLinesEst++;
+    if (cur.indexOf('\n') >= 0) numLinesEst++;
+    return prev + cur.replace(/\u001b\[\d\d?m/g, '').length + 1;
+  }, 0);
+
+  if (length > 60) {
+    return braces[0] +
+           (base === '' ? '' : base + '\n ') +
+           ' ' +
+           output.join(',\n  ') +
+           ' ' +
+           braces[1];
+  }
+
+  return braces[0] + base + ' ' + output.join(', ') + ' ' + braces[1];
+}
+
+
+// NOTE: These type checking functions intentionally don't use `instanceof`
+// because it is fragile and can be easily faked with `Object.create()`.
+function isArray(ar) {
+  return Array.isArray(ar);
+}
+exports.isArray = isArray;
+
+function isBoolean(arg) {
+  return typeof arg === 'boolean';
+}
+exports.isBoolean = isBoolean;
+
+function isNull(arg) {
+  return arg === null;
+}
+exports.isNull = isNull;
+
+function isNullOrUndefined(arg) {
+  return arg == null;
+}
+exports.isNullOrUndefined = isNullOrUndefined;
+
+function isNumber(arg) {
+  return typeof arg === 'number';
+}
+exports.isNumber = isNumber;
+
+function isString(arg) {
+  return typeof arg === 'string';
+}
+exports.isString = isString;
+
+function isSymbol(arg) {
+  return typeof arg === 'symbol';
+}
+exports.isSymbol = isSymbol;
+
+function isUndefined(arg) {
+  return arg === void 0;
+}
+exports.isUndefined = isUndefined;
+
+function isRegExp(re) {
+  return isObject(re) && objectToString(re) === '[object RegExp]';
+}
+exports.isRegExp = isRegExp;
+
+function isObject(arg) {
+  return typeof arg === 'object' && arg !== null;
+}
+exports.isObject = isObject;
+
+function isDate(d) {
+  return isObject(d) && objectToString(d) === '[object Date]';
+}
+exports.isDate = isDate;
+
+function isError(e) {
+  return isObject(e) &&
+      (objectToString(e) === '[object Error]' || e instanceof Error);
+}
+exports.isError = isError;
+
+function isFunction(arg) {
+  return typeof arg === 'function';
+}
+exports.isFunction = isFunction;
+
+function isPrimitive(arg) {
+  return arg === null ||
+         typeof arg === 'boolean' ||
+         typeof arg === 'number' ||
+         typeof arg === 'string' ||
+         typeof arg === 'symbol' ||  // ES6 symbol
+         typeof arg === 'undefined';
+}
+exports.isPrimitive = isPrimitive;
+
+exports.isBuffer = _dereq_('./support/isBuffer');
+
+function objectToString(o) {
+  return Object.prototype.toString.call(o);
+}
+
+
+function pad(n) {
+  return n < 10 ? '0' + n.toString(10) : n.toString(10);
+}
+
+
+var months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep',
+              'Oct', 'Nov', 'Dec'];
+
+// 26 Feb 16:19:34
+function timestamp() {
+  var d = new Date();
+  var time = [pad(d.getHours()),
+              pad(d.getMinutes()),
+              pad(d.getSeconds())].join(':');
+  return [d.getDate(), months[d.getMonth()], time].join(' ');
+}
+
+
+// log is just a thin wrapper to console.log that prepends a timestamp
+exports.log = function() {
+  console.log('%s - %s', timestamp(), exports.format.apply(exports, arguments));
+};
+
+
+/**
+ * Inherit the prototype methods from one constructor into another.
+ *
+ * The Function.prototype.inherits from lang.js rewritten as a standalone
+ * function (not on Function.prototype). NOTE: If this file is to be loaded
+ * during bootstrapping this function needs to be rewritten using some native
+ * functions as prototype setup using normal JavaScript does not work as
+ * expected during bootstrapping (see mirror.js in r114903).
+ *
+ * @param {function} ctor Constructor function which needs to inherit the
+ *     prototype.
+ * @param {function} superCtor Constructor function to inherit prototype from.
+ */
+exports.inherits = _dereq_('inherits');
+
+exports._extend = function(origin, add) {
+  // Don't do anything if add isn't an object
+  if (!add || !isObject(add)) return origin;
+
+  var keys = Object.keys(add);
+  var i = keys.length;
+  while (i--) {
+    origin[keys[i]] = add[keys[i]];
+  }
+  return origin;
+};
+
+function hasOwnProperty(obj, prop) {
+  return Object.prototype.hasOwnProperty.call(obj, prop);
+}
+
+}).call(this,_dereq_("FWaASH"),typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
+},{"./support/isBuffer":4,"FWaASH":3,"inherits":2}],6:[function(_dereq_,module,exports){
+// getScreenMedia helper by @HenrikJoreteg
+var getUserMedia = _dereq_('getusermedia');
+
+// cache for constraints and callback
+var cache = {};
+
+module.exports = function (constraints, cb) {
+    var hasConstraints = arguments.length === 2;
+    var callback = hasConstraints ? cb : constraints;
+    var error;
+
+    if (typeof window === 'undefined' || window.location.protocol === 'http:') {
+        error = new Error('NavigatorUserMediaError');
+        error.name = 'HTTPS_REQUIRED';
+        return callback(error);
+    }
+
+    if (window.navigator.userAgent.match('Chrome')) { 
+        var chromever = parseInt(window.navigator.userAgent.match(/Chrome\/(.*) /)[1], 10);
+        var maxver = 33;
+        // "known‶ bug in chrome 34 on linux
+        if (window.navigator.userAgent.match('Linux')) maxver = 34;
+        if (chromever >= 26 && chromever <= maxver) {
+            // chrome 26 - chrome 33 way to do it -- requires bad chrome://flags
+            constraints = (hasConstraints && constraints) || { 
+                video: {
+                    mandatory: {
+                        maxWidth: window.screen.width,
+                        maxHeight: window.screen.height,
+                        maxFrameRate: 3,
+                        chromeMediaSource: 'screen'
+                    }
+                }
+            };
+            getUserMedia(constraints, callback);
+        } else {
+            // chrome 34+ way requiring an extension
+            var pending = window.setTimeout(function () {
+                error = new Error('NavigatorUserMediaError');
+                error.name = 'EXTENSION_UNAVAILABLE';
+                return callback(error);
+            }, 1000);
+            cache[pending] = [callback, hasConstraints ? constraint : null];
+            window.postMessage({ type: 'getScreen', id: pending }, '*');
+        }
+    }
+};
+
+window.addEventListener('message', function (event) { 
+    if (event.origin != window.location.origin) {
+        return;
+    }
+    if (event.data.type == 'gotScreen' && cache[event.data.id]) {
+        var data = cache[event.data.id];
+        var constraints = data[1];
+        var callback = data[0];
+        delete cache[event.data.id];
+
+        if (event.data.sourceId === '') { // user canceled
+            var error = error = new Error('NavigatorUserMediaError');
+            error.name = 'PERMISSION_DENIED';
+            callback(error);
+        } else {
+            constraints = constraints || {audio: false, video: {mandatory: {
+                chromeMediaSource: 'desktop', 
+                chromeMediaSourceId: event.data.sourceId,
+                maxWidth: window.screen.width,
+                maxHeight: window.screen.height,
+                maxFrameRate: 3,
+            }}};
+            getUserMedia(constraints, callback);
+        }
+    } else if (event.data.type == 'getScreenPending') {
+        window.clearTimeout(event.data.id);
+    }
+});
+
+},{"getusermedia":7}],7:[function(_dereq_,module,exports){
+// getUserMedia helper by @HenrikJoreteg
+var func = (window.navigator.getUserMedia ||
+            window.navigator.webkitGetUserMedia ||
+            window.navigator.mozGetUserMedia ||
+            window.navigator.msGetUserMedia);
+
+
+module.exports = function (constraints, cb) {
+    var options;
+    var haveOpts = arguments.length === 2;
+    var defaultOpts = {video: true, audio: true};
+    var error;
+    var denied = 'PERMISSION_DENIED';
+    var notSatified = 'CONSTRAINT_NOT_SATISFIED';
+
+    // make constraints optional
+    if (!haveOpts) {
+        cb = constraints;
+        constraints = defaultOpts;
+    }
+
+    // treat lack of browser support like an error
+    if (!func) {
+        // throw proper error per spec
+        error = new Error('NavigatorUserMediaError');
+        error.name = 'NOT_SUPPORTED_ERROR';
+        return cb(error);
+    }
+
+    func.call(window.navigator, constraints, function (stream) {
+        cb(null, stream);
+    }, function (err) {
+        var error;
+        // coerce into an error object since FF gives us a string
+        // there are only two valid names according to the spec
+        // we coerce all non-denied to "constraint not satisfied".
+        if (typeof err === 'string') {
+            error = new Error('NavigatorUserMediaError');
+            if (err === denied) {
+                error.name = denied;
+            } else {
+                error.name = notSatified;
+            }
+        } else {
+            // if we get an error object make sure '.name' property is set
+            // according to spec: http://dev.w3.org/2011/webrtc/editor/getusermedia.html#navigatorusermediaerror-and-navigatorusermediaerrorcallback
+            error = err;
+            if (!error.name) {
+                // this is likely chrome which
+                // sets a property called "ERROR_DENIED" on the error object
+                // if so we make sure to set a name
+                if (error[denied]) {
+                    err.name = denied;
+                } else {
+                    err.name = notSatified;
+                }
+            }
+        }
+
+        cb(error);
+    });
+};
+
+},{}],8:[function(_dereq_,module,exports){
 var methods = "assert,count,debug,dir,dirxml,error,exception,group,groupCollapsed,groupEnd,info,log,markTimeline,profile,profileEnd,time,timeEnd,trace,warn".split(",");
 var l = methods.length;
 var fn = function () {};
@@ -654,7 +880,7 @@ while (l--) {
 
 module.exports = mockconsole;
 
-},{}],8:[function(require,module,exports){
+},{}],9:[function(_dereq_,module,exports){
 /*! Socket.IO.js build:0.9.16, development. Copyright(c) 2011 LearnBoost <dev@learnboost.com> MIT Licensed */
 
 var io = ('undefined' === typeof module ? {} : module.exports);
@@ -4528,82 +4754,7 @@ if (typeof define === "function" && define.amd) {
   define([], function () { return io; });
 }
 })();
-},{}],6:[function(require,module,exports){
-// getScreenMedia helper by @HenrikJoreteg
-var getUserMedia = require('getusermedia');
-
-// cache for constraints and callback
-var cache = {};
-
-module.exports = function (constraints, cb) {
-    var hasConstraints = arguments.length === 2;
-    var callback = hasConstraints ? cb : constraints;
-    var error;
-
-    if (typeof window === 'undefined' || window.location.protocol === 'http:') {
-        error = new Error('NavigatorUserMediaError');
-        error.name = 'HTTPS_REQUIRED';
-        return callback(error);
-    }
-
-    if (window.navigator.userAgent.match('Chrome')) { 
-        var chromever = parseInt(window.navigator.userAgent.match(/Chrome\/(.*) /)[1], 10);
-        if (chromever >= 26 && chromever <= 33) {
-            // chrome 26 - chrome 33 way to do it -- requires bad chrome://flags
-            constraints = (hasConstraints && constraints) || { 
-                video: {
-                    mandatory: {
-                        maxWidth: window.screen.width,
-                        maxHeight: window.screen.height,
-                        maxFrameRate: 3,
-                        chromeMediaSource: 'screen'
-                    }
-                }
-            };
-            getUserMedia(constraints, callback);
-        } else {
-            // chrome 34+ way requiring an extension
-            var pending = window.setTimeout(function () {
-                error = new Error('NavigatorUserMediaError');
-                error.name = 'EXTENSION_UNAVAILABLE';
-                return callback(error);
-            }, 1000);
-            cache[pending] = [callback, hasConstraints ? constraint : null];
-            window.postMessage({ type: 'getScreen', id: pending }, '*');
-        }
-    }
-};
-
-window.addEventListener('message', function (event) { 
-    if (event.origin != window.location.origin) {
-        return;
-    }
-    if (event.data.type == 'gotScreen' && cache[event.data.id]) {
-        var data = cache[event.data.id];
-        var constraints = data[1];
-        var callback = data[0];
-        delete cache[event.data.id];
-
-        if (event.data.sourceId === '') { // user canceled
-            var error = error = new Error('NavigatorUserMediaError');
-            error.name = 'PERMISSION_DENIED';
-            callback(error);
-        } else {
-            constraints = constraints || {audio: false, video: {mandatory: {
-                chromeMediaSource: 'desktop', 
-                chromeMediaSourceId: event.data.sourceId,
-                maxWidth: window.screen.width,
-                maxHeight: window.screen.height,
-                maxFrameRate: 3,
-            }}};
-            getUserMedia(constraints, callback);
-        }
-    } else if (event.data.type == 'getScreenPending') {
-        window.clearTimeout(event.data.id);
-    }
-});
-
-},{"getusermedia":9}],10:[function(require,module,exports){
+},{}],10:[function(_dereq_,module,exports){
 // getUserMedia helper by @HenrikJoreteg
 var func = (navigator.getUserMedia ||
             navigator.webkitGetUserMedia ||
@@ -4667,915 +4818,372 @@ module.exports = function (constraints, cb) {
     });
 };
 
-},{}],11:[function(require,module,exports){
-// created by @HenrikJoreteg
-var prefix;
-var isChrome = false;
-var isFirefox = false;
-var ua = navigator.userAgent.toLowerCase();
-
-// basic sniffing
-if (ua.indexOf('firefox') !== -1) {
-    prefix = 'moz';
-    isFirefox = true;
-} else if (ua.indexOf('chrome') !== -1) {
-    prefix = 'webkit';
-    isChrome = true;
-}
-
-var PC = window.mozRTCPeerConnection || window.webkitRTCPeerConnection;
-var IceCandidate = window.mozRTCIceCandidate || window.RTCIceCandidate;
-var SessionDescription = window.mozRTCSessionDescription || window.RTCSessionDescription;
-var MediaStream = window.webkitMediaStream || window.MediaStream;
-var screenSharing = navigator.userAgent.match('Chrome') && parseInt(navigator.userAgent.match(/Chrome\/(.*) /)[1], 10) >= 26;
-var AudioContext = window.webkitAudioContext || window.AudioContext;
-
-
-// export support flags and constructors.prototype && PC
-module.exports = {
-    support: !!PC,
-    dataChannel: isChrome || isFirefox || (PC && PC.prototype && PC.prototype.createDataChannel),
-    prefix: prefix,
-    webAudio: !!(AudioContext && AudioContext.prototype.createMediaStreamSource),
-    mediaStream: !!(MediaStream && MediaStream.prototype.removeTrack),
-    screenSharing: !!screenSharing,
-    AudioContext: AudioContext,
-    PeerConnection: PC,
-    SessionDescription: SessionDescription,
-    IceCandidate: IceCandidate
-};
-
-},{}],9:[function(require,module,exports){
-// getUserMedia helper by @HenrikJoreteg
-var func = (window.navigator.getUserMedia ||
-            window.navigator.webkitGetUserMedia ||
-            window.navigator.mozGetUserMedia ||
-            window.navigator.msGetUserMedia);
-
-
-module.exports = function (constraints, cb) {
-    var options;
-    var haveOpts = arguments.length === 2;
-    var defaultOpts = {video: true, audio: true};
-    var error;
-    var denied = 'PERMISSION_DENIED';
-    var notSatified = 'CONSTRAINT_NOT_SATISFIED';
-
-    // make constraints optional
-    if (!haveOpts) {
-        cb = constraints;
-        constraints = defaultOpts;
-    }
-
-    // treat lack of browser support like an error
-    if (!func) {
-        // throw proper error per spec
-        error = new Error('NavigatorUserMediaError');
-        error.name = 'NOT_SUPPORTED_ERROR';
-        return cb(error);
-    }
-
-    func.call(window.navigator, constraints, function (stream) {
-        cb(null, stream);
-    }, function (err) {
-        var error;
-        // coerce into an error object since FF gives us a string
-        // there are only two valid names according to the spec
-        // we coerce all non-denied to "constraint not satisfied".
-        if (typeof err === 'string') {
-            error = new Error('NavigatorUserMediaError');
-            if (err === denied) {
-                error.name = denied;
-            } else {
-                error.name = notSatified;
-            }
-        } else {
-            // if we get an error object make sure '.name' property is set
-            // according to spec: http://dev.w3.org/2011/webrtc/editor/getusermedia.html#navigatorusermediaerror-and-navigatorusermediaerrorcallback
-            error = err;
-            if (!error.name) {
-                // this is likely chrome which
-                // sets a property called "ERROR_DENIED" on the error object
-                // if so we make sure to set a name
-                if (error[denied]) {
-                    err.name = denied;
-                } else {
-                    err.name = notSatified;
-                }
-            }
-        }
-
-        cb(error);
-    });
-};
-
-},{}],2:[function(require,module,exports){
-var webrtc = require('webrtcsupport');
-var getUserMedia = require('getusermedia');
-var PeerConnection = require('rtcpeerconnection');
-var WildEmitter = require('wildemitter');
-var hark = require('hark');
-var GainController = require('mediastream-gain');
-var mockconsole = require('mockconsole');
-
-
-function WebRTC(opts) {
-    var self = this;
-    var options = opts || {};
-    var config = this.config = {
-            debug: false,
-            localVideoEl: '',
-            remoteVideosEl: '',
-            autoRequestMedia: false,
-            // makes the entire PC config overridable
-            peerConnectionConfig: {
-                iceServers: [{"url": "stun:stun.l.google.com:19302"}]
-            },
-            peerConnectionContraints: {
-                optional: [
-                    {DtlsSrtpKeyAgreement: true}
-                ]
-            },
-            autoAdjustMic: false,
-            media: {
-                audio: true,
-                video: true
-            },
-            receiveMedia: {
-                mandatory: {
-                    OfferToReceiveAudio: true,
-                    OfferToReceiveVideo: true
-                }
-            },
-            detectSpeakingEvents: true,
-            enableDataChannels: true
-        };
-    var item, connection;
-
-    // expose screensharing check
-    this.screenSharingSupport = webrtc.screenSharing;
-
-    // We also allow a 'logger' option. It can be any object that implements
-    // log, warn, and error methods.
-    // We log nothing by default, following "the rule of silence":
-    // http://www.linfo.org/rule_of_silence.html
-    this.logger = function () {
-        // we assume that if you're in debug mode and you didn't
-        // pass in a logger, you actually want to log as much as
-        // possible.
-        if (opts.debug) {
-            return opts.logger || console;
-        } else {
-        // or we'll use your logger which should have its own logic
-        // for output. Or we'll return the no-op.
-            return opts.logger || mockconsole;
-        }
-    }();
-
-    // set options
-    for (item in options) {
-        this.config[item] = options[item];
-    }
-
-    // check for support
-    if (!webrtc.support) {
-        this.logger.error('Your browser doesn\'t seem to support WebRTC');
-    }
-
-    // where we'll store our peer connections
-    this.peers = [];
-
-    WildEmitter.call(this);
-
-    // log events in debug mode
-    if (this.config.debug) {
-        this.on('*', function (event, val1, val2) {
-            var logger;
-            // if you didn't pass in a logger and you explicitly turning on debug
-            // we're just going to assume you're wanting log output with console
-            if (self.config.logger === mockconsole) {
-                logger = console;
-            } else {
-                logger = self.logger;
-            }
-            logger.log('event:', event, val1, val2);
-        });
-    }
-}
-
-WebRTC.prototype = Object.create(WildEmitter.prototype, {
-    constructor: {
-        value: WebRTC
-    }
-});
-
-WebRTC.prototype.createPeer = function (opts) {
-    var peer;
-    opts.parent = this;
-    peer = new Peer(opts);
-    this.peers.push(peer);
-    return peer;
-};
-
-WebRTC.prototype.startLocalMedia = function (mediaConstraints, cb) {
-    var self = this;
-    var constraints = mediaConstraints || {video: true, audio: true};
-
-    getUserMedia(constraints, function (err, stream) {
-        if (!err) {
-            if (constraints.audio && self.config.detectSpeakingEvents) {
-                self.setupAudioMonitor(stream);
-            }
-            self.localStream = stream;
-
-            if (self.config.autoAdjustMic) {
-                self.gainController = new GainController(stream);
-                // start out somewhat muted if we can track audio
-                self.setMicIfEnabled(0.5);
-            }
-
-            self.emit('localStream', stream);
-        }
-        if (cb) cb(err, stream);
-    });
-};
-
-WebRTC.prototype.stopLocalMedia = function () {
-    if (this.localStream) {
-        this.localStream.stop();
-        this.emit('localStreamStopped');
-    }
-};
-
-// Audio controls
-WebRTC.prototype.mute = function () {
-    this._audioEnabled(false);
-    this.hardMuted = true;
-    this.emit('audioOff');
-};
-WebRTC.prototype.unmute = function () {
-    this._audioEnabled(true);
-    this.hardMuted = false;
-    this.emit('audioOn');
-};
-
-// Audio monitor
-WebRTC.prototype.setupAudioMonitor = function (stream) {
-    this.logger.log('Setup audio');
-    var audio = hark(stream);
-    var self = this;
-    var timeout;
-
-    audio.on('speaking', function () {
-        self.emit('speaking');
-        if (self.hardMuted) return;
-        self.setMicIfEnabled(1);
-        self.sendToAll('speaking', {});
-    });
-
-    audio.on('stopped_speaking', function () {
-        if (timeout) clearTimeout(timeout);
-
-        timeout = setTimeout(function () {
-            self.emit('stoppedSpeaking');
-            if (self.hardMuted) return;
-            self.setMicIfEnabled(0.5);
-            self.sendToAll('stopped_speaking', {});
-        }, 1000);
-    });
-    if (this.config.enableDataChannels) {
-        // until https://code.google.com/p/chromium/issues/detail?id=121673 is fixed...
-        audio.on('volume_change', function (volume, treshold) {
-            self.emit('volumeChange', volume, treshold);
-            if (self.hardMuted) return;
-            // FIXME: should use sendDirectlyToAll, but currently has different semantics wrt payload
-            self.peers.forEach(function (peer) {
-                if (peer.enableDataChannels) {
-                    var dc = peer.getDataChannel('hark');
-                    if (dc.readyState != 'open') return;
-                    dc.send(JSON.stringify({type: 'volume', volume: volume }));
-                }
-            });
-        });
-    }
-};
-
-// We do this as a seperate method in order to
-// still leave the "setMicVolume" as a working
-// method.
-WebRTC.prototype.setMicIfEnabled = function (volume) {
-    if (!this.config.autoAdjustMic) return;
-    this.gainController.setGain(volume);
-};
-
-// Video controls
-WebRTC.prototype.pauseVideo = function () {
-    this._videoEnabled(false);
-    this.emit('videoOff');
-};
-WebRTC.prototype.resumeVideo = function () {
-    this._videoEnabled(true);
-    this.emit('videoOn');
-};
-
-// Combined controls
-WebRTC.prototype.pause = function () {
-    this._audioEnabled(false);
-    this.pauseVideo();
-};
-WebRTC.prototype.resume = function () {
-    this._audioEnabled(true);
-    this.resumeVideo();
-};
-
-// Internal methods for enabling/disabling audio/video
-WebRTC.prototype._audioEnabled = function (bool) {
-    // work around for chrome 27 bug where disabling tracks
-    // doesn't seem to work (works in canary, remove when working)
-    this.setMicIfEnabled(bool ? 1 : 0);
-    this.localStream.getAudioTracks().forEach(function (track) {
-        track.enabled = !!bool;
-    });
-};
-WebRTC.prototype._videoEnabled = function (bool) {
-    this.localStream.getVideoTracks().forEach(function (track) {
-        track.enabled = !!bool;
-    });
-};
-
-// removes peers
-WebRTC.prototype.removePeers = function (id, type) {
-    this.getPeers(id, type).forEach(function (peer) {
-        peer.end();
-    });
-};
-
-// fetches all Peer objects by session id and/or type
-WebRTC.prototype.getPeers = function (sessionId, type) {
-    return this.peers.filter(function (peer) {
-        return (!sessionId || peer.id === sessionId) && (!type || peer.type === type);
-    });
-};
-
-// sends message to all
-WebRTC.prototype.sendToAll = function (message, payload) {
-    this.peers.forEach(function (peer) {
-        peer.send(message, payload);
-    });
-};
-
-// sends message to all using a datachannel
-// only sends to anyone who has an open datachannel
-WebRTC.prototype.sendDirectlyToAll = function (channel, message, payload) {
-    this.peers.forEach(function (peer) {
-        if (peer.enableDataChannels) {
-            peer.sendDirectly(channel, message, payload);
-        }
-    });
-};
-
-function Peer(options) {
-    var self = this;
-
-    this.id = options.id;
-    this.parent = options.parent;
-    this.type = options.type || 'video';
-    this.oneway = options.oneway || false;
-    this.sharemyscreen = options.sharemyscreen || false;
-    this.browserPrefix = options.prefix;
-    this.stream = options.stream;
-    this.enableDataChannels = options.enableDataChannels === undefined ? this.parent.config.enableDataChannels : options.enableDataChannels;
-    this.receiveMedia = options.receiveMedia || this.parent.config.receiveMedia;
-    this.channels = {};
-    // Create an RTCPeerConnection via the polyfill
-    this.pc = new PeerConnection(this.parent.config.peerConnectionConfig, this.parent.config.peerConnectionContraints);
-    this.pc.on('ice', this.onIceCandidate.bind(this));
-    this.pc.on('addStream', this.handleRemoteStreamAdded.bind(this));
-    this.pc.on('addChannel', this.handleDataChannelAdded.bind(this));
-    this.pc.on('removeStream', this.handleStreamRemoved.bind(this));
-    // Just fire negotiation needed events for now
-    // When browser re-negotiation handling seems to work
-    // we can use this as the trigger for starting the offer/answer process
-    // automatically. We'll just leave it be for now while this stabalizes.
-    this.pc.on('negotiationNeeded', this.emit.bind(this, 'negotiationNeeded'));
-    this.pc.on('iceConnectionStateChange', this.emit.bind(this, 'iceConnectionStateChange'));
-    this.pc.on('signalingStateChange', this.emit.bind(this, 'signalingStateChange'));
-    this.logger = this.parent.logger;
-
-    // handle screensharing/broadcast mode
-    if (options.type === 'screen') {
-        if (this.parent.localScreen && this.sharemyscreen) {
-            this.logger.log('adding local screen stream to peer connection');
-            this.pc.addStream(this.parent.localScreen);
-            this.broadcaster = options.broadcaster;
-        }
-    } else {
-        this.pc.addStream(this.parent.localStream);
-    }
-
-    // call emitter constructor
-    WildEmitter.call(this);
-
-    // proxy events to parent
-    this.on('*', function () {
-        self.parent.emit.apply(self.parent, arguments);
-    });
-}
-
-Peer.prototype = Object.create(WildEmitter.prototype, {
-    constructor: {
-        value: Peer
-    }
-});
-
-Peer.prototype.handleMessage = function (message) {
-    var self = this;
-
-    this.logger.log('getting', message.type, message);
-
-    if (message.prefix) this.browserPrefix = message.prefix;
-
-    if (message.type === 'offer') {
-        this.pc.handleOffer(message.payload, function (err) {
-            if (err) {
-                return;
-            }
-            // auto-accept
-            self.pc.answer(self.receiveMedia, function (err, sessionDescription) {
-                self.send('answer', sessionDescription);
-            });
-        });
-    } else if (message.type === 'answer') {
-        this.pc.handleAnswer(message.payload);
-    } else if (message.type === 'candidate') {
-        this.pc.processIce(message.payload);
-    } else if (message.type === 'speaking') {
-        this.parent.emit('speaking', {id: message.from});
-    } else if (message.type === 'stopped_speaking') {
-        this.parent.emit('stopped_speaking', {id: message.from});
-    } else if (message.type === 'mute') {
-        this.parent.emit('mute', {id: message.from, name: message.payload.name});
-    } else if (message.type === 'unmute') {
-        this.parent.emit('unmute', {id: message.from, name: message.payload.name});
-    }
-};
-
-// send via signalling channel
-Peer.prototype.send = function (messageType, payload) {
-    var message = {
-        to: this.id,
-        broadcaster: this.broadcaster,
-        roomType: this.type,
-        type: messageType,
-        payload: payload,
-        prefix: webrtc.prefix
-    };
-    this.logger.log('sending', messageType, message);
-    this.parent.emit('message', message);
-};
-
-// send via data channel
-// returns true when message was sent and false if channel is not open
-Peer.prototype.sendDirectly = function (channel, messageType, payload) {
-    var message = {
-        type: messageType,
-        payload: payload
-    };
-    this.logger.log('sending via datachannel', channel, messageType, message);
-    var dc = this.getDataChannel(channel);
-    if (dc.readyState != 'open') return false;
-    dc.send(JSON.stringify(message));
-    return true;
-};
-
-// Internal method registering handlers for a data channel and emitting events on the peer
-Peer.prototype._observeDataChannel = function (channel) {
-    var self = this;
-    channel.onclose = this.emit.bind(this, 'channelClose', channel);
-    channel.onerror = this.emit.bind(this, 'channelError', channel);
-    channel.onmessage = function (event) {
-        self.emit('channelMessage', self, channel.label, JSON.parse(event.data), channel, event);
-    };
-    channel.onopen = this.emit.bind(this, 'channelOpen', channel);
-};
-
-// Fetch or create a data channel by the given name
-Peer.prototype.getDataChannel = function (name, opts) {
-    if (!webrtc.dataChannel) return this.emit('error', new Error('createDataChannel not supported'));
-    var channel = this.channels[name];
-    opts || (opts = {});
-    if (channel) return channel;
-    // if we don't have one by this label, create it
-    channel = this.channels[name] = this.pc.createDataChannel(name, opts);
-    this._observeDataChannel(channel);
-    return channel;
-};
-
-Peer.prototype.onIceCandidate = function (candidate) {
-    if (this.closed) return;
-    if (candidate) {
-        this.send('candidate', candidate);
-    } else {
-        this.logger.log("End of candidates.");
-    }
-};
-
-Peer.prototype.start = function () {
-    var self = this;
-
-    // well, the webrtc api requires that we either
-    // a) create a datachannel a priori
-    // b) do a renegotiation later to add the SCTP m-line
-    // Let's do (a) first...
-    if (this.enableDataChannels) {
-        this.getDataChannel('simplewebrtc');
-    }
-
-    this.pc.offer(this.receiveMedia, function (err, sessionDescription) {
-        self.send('offer', sessionDescription);
-    });
-};
-
-Peer.prototype.end = function () {
-    if (this.closed) return;
-    this.pc.close();
-    this.handleStreamRemoved();
-};
-
-Peer.prototype.handleRemoteStreamAdded = function (event) {
-    var self = this;
-    if (this.stream) {
-        this.logger.warn('Already have a remote stream');
-    } else {
-        this.stream = event.stream;
-        this.stream.onended = function () {
-            self.end();
-        };
-        this.parent.emit('peerStreamAdded', this);
-    }
-};
-
-Peer.prototype.handleStreamRemoved = function () {
-    this.parent.peers.splice(this.parent.peers.indexOf(this), 1);
-    this.closed = true;
-    this.parent.emit('peerStreamRemoved', this);
-};
-
-Peer.prototype.handleDataChannelAdded = function (channel) {
-    this.channels[channel.label] = channel;
-    this._observeDataChannel(channel);
-};
-
-module.exports = WebRTC;
-
-},{"getusermedia":10,"hark":13,"mediastream-gain":14,"mockconsole":7,"rtcpeerconnection":12,"webrtcsupport":11,"wildemitter":3}],15:[function(require,module,exports){
-var events = require('events');
-
-exports.isArray = isArray;
-exports.isDate = function(obj){return Object.prototype.toString.call(obj) === '[object Date]'};
-exports.isRegExp = function(obj){return Object.prototype.toString.call(obj) === '[object RegExp]'};
-
-
-exports.print = function () {};
-exports.puts = function () {};
-exports.debug = function() {};
-
-exports.inspect = function(obj, showHidden, depth, colors) {
-  var seen = [];
-
-  var stylize = function(str, styleType) {
-    // http://en.wikipedia.org/wiki/ANSI_escape_code#graphics
-    var styles =
-        { 'bold' : [1, 22],
-          'italic' : [3, 23],
-          'underline' : [4, 24],
-          'inverse' : [7, 27],
-          'white' : [37, 39],
-          'grey' : [90, 39],
-          'black' : [30, 39],
-          'blue' : [34, 39],
-          'cyan' : [36, 39],
-          'green' : [32, 39],
-          'magenta' : [35, 39],
-          'red' : [31, 39],
-          'yellow' : [33, 39] };
-
-    var style =
-        { 'special': 'cyan',
-          'number': 'blue',
-          'boolean': 'yellow',
-          'undefined': 'grey',
-          'null': 'bold',
-          'string': 'green',
-          'date': 'magenta',
-          // "name": intentionally not styling
-          'regexp': 'red' }[styleType];
-
-    if (style) {
-      return '\u001b[' + styles[style][0] + 'm' + str +
-             '\u001b[' + styles[style][1] + 'm';
-    } else {
-      return str;
+},{}],11:[function(_dereq_,module,exports){
+var WildEmitter = _dereq_('wildemitter');
+
+function getMaxVolume (analyser, fftBins) {
+  var maxVolume = -Infinity;
+  analyser.getFloatFrequencyData(fftBins);
+
+  for(var i=0, ii=fftBins.length; i < ii; i++) {
+    if (fftBins[i] > maxVolume && fftBins[i] < 0) {
+      maxVolume = fftBins[i];
     }
   };
-  if (! colors) {
-    stylize = function(str, styleType) { return str; };
+
+  return maxVolume;
+}
+
+
+var audioContextType = window.webkitAudioContext || window.AudioContext;
+// use a single audio context due to hardware limits
+var audioContext = null;
+module.exports = function(stream, options) {
+  var harker = new WildEmitter();
+
+
+  // make it not break in non-supported browsers
+  if (!audioContextType) return harker;
+
+  //Config
+  var options = options || {},
+      smoothing = (options.smoothing || 0.5),
+      interval = (options.interval || 100),
+      threshold = options.threshold,
+      play = options.play,
+      running = true;
+
+  //Setup Audio Context
+  if (!audioContext) {
+    audioContext = new audioContextType();
+  }
+  var sourceNode, fftBins, analyser;
+
+  analyser = audioContext.createAnalyser();
+  analyser.fftSize = 512;
+  analyser.smoothingTimeConstant = smoothing;
+  fftBins = new Float32Array(analyser.fftSize);
+
+  if (stream.jquery) stream = stream[0];
+  if (stream instanceof HTMLAudioElement) {
+    //Audio Tag
+    sourceNode = audioContext.createMediaElementSource(stream);
+    if (typeof play === 'undefined') play = true;
+    threshold = threshold || -65;
+  } else {
+    //WebRTC Stream
+    sourceNode = audioContext.createMediaStreamSource(stream);
+    threshold = threshold || -45;
   }
 
-  function format(value, recurseTimes) {
-    // Provide a hook for user-specified inspect functions.
-    // Check that value is an object with an inspect function on it
-    if (value && typeof value.inspect === 'function' &&
-        // Filter out the util module, it's inspect function is special
-        value !== exports &&
-        // Also filter out any prototype objects using the circular check.
-        !(value.constructor && value.constructor.prototype === value)) {
-      return value.inspect(recurseTimes);
+  sourceNode.connect(analyser);
+  if (play) analyser.connect(audioContext.destination);
+
+  harker.speaking = false;
+
+  harker.setThreshold = function(t) {
+    threshold = t;
+  };
+
+  harker.setInterval = function(i) {
+    interval = i;
+  };
+  
+  harker.stop = function() {
+    running = false;
+    harker.emit('volume_change', -100, threshold);
+    if (harker.speaking) {
+      harker.speaking = false;
+      harker.emit('stopped_speaking');
     }
+  };
 
-    // Primitive types cannot have properties
-    switch (typeof value) {
-      case 'undefined':
-        return stylize('undefined', 'undefined');
+  // Poll the analyser node to determine if speaking
+  // and emit events if changed
+  var looper = function() {
+    setTimeout(function() {
+    
+      //check if stop has been called
+      if(!running) {
+        return;
+      }
+      
+      var currentVolume = getMaxVolume(analyser, fftBins);
 
-      case 'string':
-        var simple = '\'' + JSON.stringify(value).replace(/^"|"$/g, '')
-                                                 .replace(/'/g, "\\'")
-                                                 .replace(/\\"/g, '"') + '\'';
-        return stylize(simple, 'string');
+      harker.emit('volume_change', currentVolume, threshold);
 
-      case 'number':
-        return stylize('' + value, 'number');
-
-      case 'boolean':
-        return stylize('' + value, 'boolean');
-    }
-    // For some reason typeof null is "object", so special case here.
-    if (value === null) {
-      return stylize('null', 'null');
-    }
-
-    // Look up the keys of the object.
-    var visible_keys = Object_keys(value);
-    var keys = showHidden ? Object_getOwnPropertyNames(value) : visible_keys;
-
-    // Functions without properties can be shortcutted.
-    if (typeof value === 'function' && keys.length === 0) {
-      if (isRegExp(value)) {
-        return stylize('' + value, 'regexp');
+      if (currentVolume > threshold) {
+        if (!harker.speaking) {
+          harker.speaking = true;
+          harker.emit('speaking');
+        }
       } else {
-        var name = value.name ? ': ' + value.name : '';
-        return stylize('[Function' + name + ']', 'special');
+        if (harker.speaking) {
+          harker.speaking = false;
+          harker.emit('stopped_speaking');
+        }
       }
-    }
 
-    // Dates without properties can be shortcutted
-    if (isDate(value) && keys.length === 0) {
-      return stylize(value.toUTCString(), 'date');
-    }
+      looper();
+    }, interval);
+  };
+  looper();
 
-    var base, type, braces;
-    // Determine the object type
-    if (isArray(value)) {
-      type = 'Array';
-      braces = ['[', ']'];
+
+  return harker;
+}
+
+},{"wildemitter":23}],12:[function(_dereq_,module,exports){
+var support = _dereq_('webrtcsupport');
+
+
+function GainController(stream) {
+    this.support = support.webAudio && support.mediaStream;
+
+    // set our starting value
+    this.gain = 1;
+
+    if (this.support) {
+        var context = this.context = new support.AudioContext();
+        this.microphone = context.createMediaStreamSource(stream);
+        this.gainFilter = context.createGain();
+        this.destination = context.createMediaStreamDestination();
+        this.outputStream = this.destination.stream;
+        this.microphone.connect(this.gainFilter);
+        this.gainFilter.connect(this.destination);
+        stream.removeTrack(stream.getAudioTracks()[0]);
+        stream.addTrack(this.outputStream.getAudioTracks()[0]);
+    }
+    this.stream = stream;
+}
+
+// setting
+GainController.prototype.setGain = function (val) {
+    // check for support
+    if (!this.support) return;
+    this.gainFilter.gain.value = val;
+    this.gain = val;
+};
+
+GainController.prototype.getGain = function () {
+    return this.gain;
+};
+
+GainController.prototype.off = function () {
+    return this.setGain(0);
+};
+
+GainController.prototype.on = function () {
+    this.setGain(1);
+};
+
+
+module.exports = GainController;
+
+},{"webrtcsupport":22}],13:[function(_dereq_,module,exports){
+module.exports=_dereq_(8)
+},{}],14:[function(_dereq_,module,exports){
+// based on https://github.com/ESTOS/strophe.jingle/
+// adds wildemitter support
+var util = _dereq_('util');
+var webrtc = _dereq_('webrtcsupport');
+var WildEmitter = _dereq_('wildemitter');
+
+function dumpSDP(description) {
+    return 'type: ' + description.type + '\r\n' + description.sdp;
+}
+
+function TraceablePeerConnection(config, constraints) {
+    var self = this;
+    WildEmitter.call(this);
+
+    this.peerconnection = new webrtc.PeerConnection(config, constraints);
+
+    this.trace = function (what, info) {
+        self.emit('PeerConnectionTrace', {
+            time: new Date(),
+            type: what,
+            value: info || ""
+        });
+    };
+
+    this.onicecandidate = null;
+    this.peerconnection.onicecandidate = function (event) {
+        self.trace('onicecandidate', JSON.stringify(event.candidate, null, ' '));
+        if (self.onicecandidate !== null) {
+            self.onicecandidate(event);
+        }
+    };
+    this.onaddstream = null;
+    this.peerconnection.onaddstream = function (event) {
+        self.trace('onaddstream', event.stream.id);
+        if (self.onaddstream !== null) {
+            self.onaddstream(event);
+        }
+    };
+    this.onremovestream = null;
+    this.peerconnection.onremovestream = function (event) {
+        self.trace('onremovestream', event.stream.id);
+        if (self.onremovestream !== null) {
+            self.onremovestream(event);
+        }
+    };
+    this.onsignalingstatechange = null;
+    this.peerconnection.onsignalingstatechange = function (event) {
+        self.trace('onsignalingstatechange', self.signalingState);
+        if (self.onsignalingstatechange !== null) {
+            self.onsignalingstatechange(event);
+        }
+    };
+    this.oniceconnectionstatechange = null;
+    this.peerconnection.oniceconnectionstatechange = function (event) {
+        self.trace('oniceconnectionstatechange', self.iceConnectionState);
+        if (self.oniceconnectionstatechange !== null) {
+            self.oniceconnectionstatechange(event);
+        }
+    };
+    this.onnegotiationneeded = null;
+    this.peerconnection.onnegotiationneeded = function (event) {
+        self.trace('onnegotiationneeded');
+        if (self.onnegotiationneeded !== null) {
+            self.onnegotiationneeded(event);
+        }
+    };
+    self.ondatachannel = null;
+    this.peerconnection.ondatachannel = function (event) {
+        self.trace('ondatachannel', event);
+        if (self.ondatachannel !== null) {
+            self.ondatachannel(event);
+        }
+    };
+}
+
+util.inherits(TraceablePeerConnection, WildEmitter);
+
+if (TraceablePeerConnection.prototype.__defineGetter__ !== undefined) {
+    TraceablePeerConnection.prototype.__defineGetter__('signalingState', function () { return this.peerconnection.signalingState; });
+    TraceablePeerConnection.prototype.__defineGetter__('iceConnectionState', function () { return this.peerconnection.iceConnectionState; });
+    TraceablePeerConnection.prototype.__defineGetter__('localDescription', function () { return this.peerconnection.localDescription; });
+    TraceablePeerConnection.prototype.__defineGetter__('remoteDescription', function () { return this.peerconnection.remoteDescription; });
+}
+
+TraceablePeerConnection.prototype.addStream = function (stream) {
+    this.trace('addStream', stream.id);
+    this.peerconnection.addStream(stream);
+};
+
+TraceablePeerConnection.prototype.removeStream = function (stream) {
+    this.trace('removeStream', stream.id);
+    this.peerconnection.removeStream(stream);
+};
+
+TraceablePeerConnection.prototype.createDataChannel = function (label, opts) {
+    this.trace('createDataChannel', label, opts);
+    return this.peerconnection.createDataChannel(label, opts);
+};
+
+TraceablePeerConnection.prototype.setLocalDescription = function (description, successCallback, failureCallback) {
+    var self = this;
+    this.trace('setLocalDescription', dumpSDP(description));
+    this.peerconnection.setLocalDescription(description,
+        function () {
+            self.trace('setLocalDescriptionOnSuccess');
+            successCallback();
+        },
+        function (err) {
+            self.trace('setLocalDescriptionOnFailure', err);
+            failureCallback(err);
+        }
+    );
+};
+
+TraceablePeerConnection.prototype.setRemoteDescription = function (description, successCallback, failureCallback) {
+    var self = this;
+    this.trace('setRemoteDescription', dumpSDP(description));
+    this.peerconnection.setRemoteDescription(description,
+        function () {
+            self.trace('setRemoteDescriptionOnSuccess');
+            successCallback();
+        },
+        function (err) {
+            self.trace('setRemoteDescriptionOnFailure', err);
+            failureCallback(err);
+        }
+    );
+};
+
+TraceablePeerConnection.prototype.close = function () {
+    this.trace('stop');
+    if (this.statsinterval !== null) {
+        window.clearInterval(this.statsinterval);
+        this.statsinterval = null;
+    }
+    if (this.peerconnection.signalingState != 'closed') {
+        this.peerconnection.close();
+    }
+};
+
+TraceablePeerConnection.prototype.createOffer = function (successCallback, failureCallback, constraints) {
+    var self = this;
+    this.trace('createOffer', JSON.stringify(constraints, null, ' '));
+    this.peerconnection.createOffer(
+        function (offer) {
+            self.trace('createOfferOnSuccess', dumpSDP(offer));
+            successCallback(offer);
+        },
+        function (err) {
+            self.trace('createOfferOnFailure', err);
+            failureCallback(err);
+        },
+        constraints
+    );
+};
+
+TraceablePeerConnection.prototype.createAnswer = function (successCallback, failureCallback, constraints) {
+    var self = this;
+    this.trace('createAnswer', JSON.stringify(constraints, null, ' '));
+    this.peerconnection.createAnswer(
+        function (answer) {
+            self.trace('createAnswerOnSuccess', dumpSDP(answer));
+            successCallback(answer);
+        },
+        function (err) {
+            self.trace('createAnswerOnFailure', err);
+            failureCallback(err);
+        },
+        constraints
+    );
+};
+
+TraceablePeerConnection.prototype.addIceCandidate = function (candidate, successCallback, failureCallback) {
+    var self = this;
+    this.trace('addIceCandidate', JSON.stringify(candidate, null, ' '));
+    this.peerconnection.addIceCandidate(candidate);
+    /* maybe later
+    this.peerconnection.addIceCandidate(candidate, 
+        function () {                                
+            self.trace('addIceCandidateOnSuccess');
+            successCallback();
+        },
+        function (err) {
+            self.trace('addIceCandidateOnFailure', err);
+            failureCallback(err);
+        }
+    );
+    */
+};
+
+TraceablePeerConnection.prototype.getStats = function (callback, errback) {
+    if (navigator.mozGetUserMedia) {
+        // ignore for now...
     } else {
-      type = 'Object';
-      braces = ['{', '}'];
+        this.peerconnection.getStats(callback);
     }
-
-    // Make functions say that they are functions
-    if (typeof value === 'function') {
-      var n = value.name ? ': ' + value.name : '';
-      base = (isRegExp(value)) ? ' ' + value : ' [Function' + n + ']';
-    } else {
-      base = '';
-    }
-
-    // Make dates with properties first say the date
-    if (isDate(value)) {
-      base = ' ' + value.toUTCString();
-    }
-
-    if (keys.length === 0) {
-      return braces[0] + base + braces[1];
-    }
-
-    if (recurseTimes < 0) {
-      if (isRegExp(value)) {
-        return stylize('' + value, 'regexp');
-      } else {
-        return stylize('[Object]', 'special');
-      }
-    }
-
-    seen.push(value);
-
-    var output = keys.map(function(key) {
-      var name, str;
-      if (value.__lookupGetter__) {
-        if (value.__lookupGetter__(key)) {
-          if (value.__lookupSetter__(key)) {
-            str = stylize('[Getter/Setter]', 'special');
-          } else {
-            str = stylize('[Getter]', 'special');
-          }
-        } else {
-          if (value.__lookupSetter__(key)) {
-            str = stylize('[Setter]', 'special');
-          }
-        }
-      }
-      if (visible_keys.indexOf(key) < 0) {
-        name = '[' + key + ']';
-      }
-      if (!str) {
-        if (seen.indexOf(value[key]) < 0) {
-          if (recurseTimes === null) {
-            str = format(value[key]);
-          } else {
-            str = format(value[key], recurseTimes - 1);
-          }
-          if (str.indexOf('\n') > -1) {
-            if (isArray(value)) {
-              str = str.split('\n').map(function(line) {
-                return '  ' + line;
-              }).join('\n').substr(2);
-            } else {
-              str = '\n' + str.split('\n').map(function(line) {
-                return '   ' + line;
-              }).join('\n');
-            }
-          }
-        } else {
-          str = stylize('[Circular]', 'special');
-        }
-      }
-      if (typeof name === 'undefined') {
-        if (type === 'Array' && key.match(/^\d+$/)) {
-          return str;
-        }
-        name = JSON.stringify('' + key);
-        if (name.match(/^"([a-zA-Z_][a-zA-Z_0-9]*)"$/)) {
-          name = name.substr(1, name.length - 2);
-          name = stylize(name, 'name');
-        } else {
-          name = name.replace(/'/g, "\\'")
-                     .replace(/\\"/g, '"')
-                     .replace(/(^"|"$)/g, "'");
-          name = stylize(name, 'string');
-        }
-      }
-
-      return name + ': ' + str;
-    });
-
-    seen.pop();
-
-    var numLinesEst = 0;
-    var length = output.reduce(function(prev, cur) {
-      numLinesEst++;
-      if (cur.indexOf('\n') >= 0) numLinesEst++;
-      return prev + cur.length + 1;
-    }, 0);
-
-    if (length > 50) {
-      output = braces[0] +
-               (base === '' ? '' : base + '\n ') +
-               ' ' +
-               output.join(',\n  ') +
-               ' ' +
-               braces[1];
-
-    } else {
-      output = braces[0] + base + ' ' + output.join(', ') + ' ' + braces[1];
-    }
-
-    return output;
-  }
-  return format(obj, (typeof depth === 'undefined' ? 2 : depth));
 };
 
+module.exports = TraceablePeerConnection;
 
-function isArray(ar) {
-  return Array.isArray(ar) ||
-         (typeof ar === 'object' && Object.prototype.toString.call(ar) === '[object Array]');
-}
-
-
-function isRegExp(re) {
-  typeof re === 'object' && Object.prototype.toString.call(re) === '[object RegExp]';
-}
-
-
-function isDate(d) {
-  return typeof d === 'object' && Object.prototype.toString.call(d) === '[object Date]';
-}
-
-function pad(n) {
-  return n < 10 ? '0' + n.toString(10) : n.toString(10);
-}
-
-var months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep',
-              'Oct', 'Nov', 'Dec'];
-
-// 26 Feb 16:19:34
-function timestamp() {
-  var d = new Date();
-  var time = [pad(d.getHours()),
-              pad(d.getMinutes()),
-              pad(d.getSeconds())].join(':');
-  return [d.getDate(), months[d.getMonth()], time].join(' ');
-}
-
-exports.log = function (msg) {};
-
-exports.pump = null;
-
-var Object_keys = Object.keys || function (obj) {
-    var res = [];
-    for (var key in obj) res.push(key);
-    return res;
-};
-
-var Object_getOwnPropertyNames = Object.getOwnPropertyNames || function (obj) {
-    var res = [];
-    for (var key in obj) {
-        if (Object.hasOwnProperty.call(obj, key)) res.push(key);
-    }
-    return res;
-};
-
-var Object_create = Object.create || function (prototype, properties) {
-    // from es5-shim
-    var object;
-    if (prototype === null) {
-        object = { '__proto__' : null };
-    }
-    else {
-        if (typeof prototype !== 'object') {
-            throw new TypeError(
-                'typeof prototype[' + (typeof prototype) + '] != \'object\''
-            );
-        }
-        var Type = function () {};
-        Type.prototype = prototype;
-        object = new Type();
-        object.__proto__ = prototype;
-    }
-    if (typeof properties !== 'undefined' && Object.defineProperties) {
-        Object.defineProperties(object, properties);
-    }
-    return object;
-};
-
-exports.inherits = function(ctor, superCtor) {
-  ctor.super_ = superCtor;
-  ctor.prototype = Object_create(superCtor.prototype, {
-    constructor: {
-      value: ctor,
-      enumerable: false,
-      writable: true,
-      configurable: true
-    }
-  });
-};
-
-var formatRegExp = /%[sdj%]/g;
-exports.format = function(f) {
-  if (typeof f !== 'string') {
-    var objects = [];
-    for (var i = 0; i < arguments.length; i++) {
-      objects.push(exports.inspect(arguments[i]));
-    }
-    return objects.join(' ');
-  }
-
-  var i = 1;
-  var args = arguments;
-  var len = args.length;
-  var str = String(f).replace(formatRegExp, function(x) {
-    if (x === '%%') return '%';
-    if (i >= len) return x;
-    switch (x) {
-      case '%s': return String(args[i++]);
-      case '%d': return Number(args[i++]);
-      case '%j': return JSON.stringify(args[i++]);
-      default:
-        return x;
-    }
-  });
-  for(var x = args[i]; i < len; x = args[++i]){
-    if (x === null || typeof x !== 'object') {
-      str += ' ' + x;
-    } else {
-      str += ' ' + exports.inspect(x);
-    }
-  }
-  return str;
-};
-
-},{"events":16}],17:[function(require,module,exports){
+},{"util":5,"webrtcsupport":22,"wildemitter":16}],15:[function(_dereq_,module,exports){
 //     Underscore.js 1.6.0
 //     http://underscorejs.org
 //     (c) 2009-2014 Jeremy Ashkenas, DocumentCloud and Investigative Reporters & Editors
@@ -6920,7 +6528,7 @@ exports.format = function(f) {
   }
 }).call(this);
 
-},{}],18:[function(require,module,exports){
+},{}],16:[function(_dereq_,module,exports){
 /*
 WildEmitter.js is a slim little event emitter by @henrikjoreteg largely based 
 on @visionmedia's Emitter from UI Kit.
@@ -7061,13 +6669,13 @@ WildEmitter.prototype.getWildcardCallbacks = function (eventName) {
     return result;
 };
 
-},{}],12:[function(require,module,exports){
-var _ = require('underscore');
-var util = require('util');
-var webrtc = require('webrtcsupport');
-var SJJ = require('sdp-jingle-json');
-var WildEmitter = require('wildemitter');
-var peerconn = require('traceablepeerconnection');
+},{}],17:[function(_dereq_,module,exports){
+var _ = _dereq_('underscore');
+var util = _dereq_('util');
+var webrtc = _dereq_('webrtcsupport');
+var SJJ = _dereq_('sdp-jingle-json');
+var WildEmitter = _dereq_('wildemitter');
+var peerconn = _dereq_('traceablepeerconnection');
 
 function PeerConnection(config, constraints) {
     var self = this;
@@ -7424,422 +7032,9 @@ PeerConnection.prototype.createDataChannel = function (name, opts) {
 
 module.exports = PeerConnection;
 
-},{"sdp-jingle-json":20,"traceablepeerconnection":19,"underscore":17,"util":15,"webrtcsupport":11,"wildemitter":18}],14:[function(require,module,exports){
-var support = require('webrtcsupport');
-
-
-function GainController(stream) {
-    this.support = support.webAudio && support.mediaStream;
-
-    // set our starting value
-    this.gain = 1;
-
-    if (this.support) {
-        var context = this.context = new support.AudioContext();
-        this.microphone = context.createMediaStreamSource(stream);
-        this.gainFilter = context.createGain();
-        this.destination = context.createMediaStreamDestination();
-        this.outputStream = this.destination.stream;
-        this.microphone.connect(this.gainFilter);
-        this.gainFilter.connect(this.destination);
-        stream.removeTrack(stream.getAudioTracks()[0]);
-        stream.addTrack(this.outputStream.getAudioTracks()[0]);
-    }
-    this.stream = stream;
-}
-
-// setting
-GainController.prototype.setGain = function (val) {
-    // check for support
-    if (!this.support) return;
-    this.gainFilter.gain.value = val;
-    this.gain = val;
-};
-
-GainController.prototype.getGain = function () {
-    return this.gain;
-};
-
-GainController.prototype.off = function () {
-    return this.setGain(0);
-};
-
-GainController.prototype.on = function () {
-    this.setGain(1);
-};
-
-
-module.exports = GainController;
-
-},{"webrtcsupport":11}],21:[function(require,module,exports){
-// shim for using process in browser
-
-var process = module.exports = {};
-
-process.nextTick = (function () {
-    var canSetImmediate = typeof window !== 'undefined'
-    && window.setImmediate;
-    var canPost = typeof window !== 'undefined'
-    && window.postMessage && window.addEventListener
-    ;
-
-    if (canSetImmediate) {
-        return function (f) { return window.setImmediate(f) };
-    }
-
-    if (canPost) {
-        var queue = [];
-        window.addEventListener('message', function (ev) {
-            var source = ev.source;
-            if ((source === window || source === null) && ev.data === 'process-tick') {
-                ev.stopPropagation();
-                if (queue.length > 0) {
-                    var fn = queue.shift();
-                    fn();
-                }
-            }
-        }, true);
-
-        return function nextTick(fn) {
-            queue.push(fn);
-            window.postMessage('process-tick', '*');
-        };
-    }
-
-    return function nextTick(fn) {
-        setTimeout(fn, 0);
-    };
-})();
-
-process.title = 'browser';
-process.browser = true;
-process.env = {};
-process.argv = [];
-
-process.binding = function (name) {
-    throw new Error('process.binding is not supported');
-}
-
-// TODO(shtylman)
-process.cwd = function () { return '/' };
-process.chdir = function (dir) {
-    throw new Error('process.chdir is not supported');
-};
-
-},{}],16:[function(require,module,exports){
-var process=require("__browserify_process");if (!process.EventEmitter) process.EventEmitter = function () {};
-
-var EventEmitter = exports.EventEmitter = process.EventEmitter;
-var isArray = typeof Array.isArray === 'function'
-    ? Array.isArray
-    : function (xs) {
-        return Object.prototype.toString.call(xs) === '[object Array]'
-    }
-;
-function indexOf (xs, x) {
-    if (xs.indexOf) return xs.indexOf(x);
-    for (var i = 0; i < xs.length; i++) {
-        if (x === xs[i]) return i;
-    }
-    return -1;
-}
-
-// By default EventEmitters will print a warning if more than
-// 10 listeners are added to it. This is a useful default which
-// helps finding memory leaks.
-//
-// Obviously not all Emitters should be limited to 10. This function allows
-// that to be increased. Set to zero for unlimited.
-var defaultMaxListeners = 10;
-EventEmitter.prototype.setMaxListeners = function(n) {
-  if (!this._events) this._events = {};
-  this._events.maxListeners = n;
-};
-
-
-EventEmitter.prototype.emit = function(type) {
-  // If there is no 'error' event listener then throw.
-  if (type === 'error') {
-    if (!this._events || !this._events.error ||
-        (isArray(this._events.error) && !this._events.error.length))
-    {
-      if (arguments[1] instanceof Error) {
-        throw arguments[1]; // Unhandled 'error' event
-      } else {
-        throw new Error("Uncaught, unspecified 'error' event.");
-      }
-      return false;
-    }
-  }
-
-  if (!this._events) return false;
-  var handler = this._events[type];
-  if (!handler) return false;
-
-  if (typeof handler == 'function') {
-    switch (arguments.length) {
-      // fast cases
-      case 1:
-        handler.call(this);
-        break;
-      case 2:
-        handler.call(this, arguments[1]);
-        break;
-      case 3:
-        handler.call(this, arguments[1], arguments[2]);
-        break;
-      // slower
-      default:
-        var args = Array.prototype.slice.call(arguments, 1);
-        handler.apply(this, args);
-    }
-    return true;
-
-  } else if (isArray(handler)) {
-    var args = Array.prototype.slice.call(arguments, 1);
-
-    var listeners = handler.slice();
-    for (var i = 0, l = listeners.length; i < l; i++) {
-      listeners[i].apply(this, args);
-    }
-    return true;
-
-  } else {
-    return false;
-  }
-};
-
-// EventEmitter is defined in src/node_events.cc
-// EventEmitter.prototype.emit() is also defined there.
-EventEmitter.prototype.addListener = function(type, listener) {
-  if ('function' !== typeof listener) {
-    throw new Error('addListener only takes instances of Function');
-  }
-
-  if (!this._events) this._events = {};
-
-  // To avoid recursion in the case that type == "newListeners"! Before
-  // adding it to the listeners, first emit "newListeners".
-  this.emit('newListener', type, listener);
-
-  if (!this._events[type]) {
-    // Optimize the case of one listener. Don't need the extra array object.
-    this._events[type] = listener;
-  } else if (isArray(this._events[type])) {
-
-    // Check for listener leak
-    if (!this._events[type].warned) {
-      var m;
-      if (this._events.maxListeners !== undefined) {
-        m = this._events.maxListeners;
-      } else {
-        m = defaultMaxListeners;
-      }
-
-      if (m && m > 0 && this._events[type].length > m) {
-        this._events[type].warned = true;
-        console.error('(node) warning: possible EventEmitter memory ' +
-                      'leak detected. %d listeners added. ' +
-                      'Use emitter.setMaxListeners() to increase limit.',
-                      this._events[type].length);
-        console.trace();
-      }
-    }
-
-    // If we've already got an array, just append.
-    this._events[type].push(listener);
-  } else {
-    // Adding the second element, need to change to array.
-    this._events[type] = [this._events[type], listener];
-  }
-
-  return this;
-};
-
-EventEmitter.prototype.on = EventEmitter.prototype.addListener;
-
-EventEmitter.prototype.once = function(type, listener) {
-  var self = this;
-  self.on(type, function g() {
-    self.removeListener(type, g);
-    listener.apply(this, arguments);
-  });
-
-  return this;
-};
-
-EventEmitter.prototype.removeListener = function(type, listener) {
-  if ('function' !== typeof listener) {
-    throw new Error('removeListener only takes instances of Function');
-  }
-
-  // does not use listeners(), so no side effect of creating _events[type]
-  if (!this._events || !this._events[type]) return this;
-
-  var list = this._events[type];
-
-  if (isArray(list)) {
-    var i = indexOf(list, listener);
-    if (i < 0) return this;
-    list.splice(i, 1);
-    if (list.length == 0)
-      delete this._events[type];
-  } else if (this._events[type] === listener) {
-    delete this._events[type];
-  }
-
-  return this;
-};
-
-EventEmitter.prototype.removeAllListeners = function(type) {
-  if (arguments.length === 0) {
-    this._events = {};
-    return this;
-  }
-
-  // does not use listeners(), so no side effect of creating _events[type]
-  if (type && this._events && this._events[type]) this._events[type] = null;
-  return this;
-};
-
-EventEmitter.prototype.listeners = function(type) {
-  if (!this._events) this._events = {};
-  if (!this._events[type]) this._events[type] = [];
-  if (!isArray(this._events[type])) {
-    this._events[type] = [this._events[type]];
-  }
-  return this._events[type];
-};
-
-EventEmitter.listenerCount = function(emitter, type) {
-  var ret;
-  if (!emitter._events || !emitter._events[type])
-    ret = 0;
-  else if (typeof emitter._events[type] === 'function')
-    ret = 1;
-  else
-    ret = emitter._events[type].length;
-  return ret;
-};
-
-},{"__browserify_process":21}],13:[function(require,module,exports){
-var WildEmitter = require('wildemitter');
-
-function getMaxVolume (analyser, fftBins) {
-  var maxVolume = -Infinity;
-  analyser.getFloatFrequencyData(fftBins);
-
-  for(var i=0, ii=fftBins.length; i < ii; i++) {
-    if (fftBins[i] > maxVolume && fftBins[i] < 0) {
-      maxVolume = fftBins[i];
-    }
-  };
-
-  return maxVolume;
-}
-
-
-var audioContextType = window.webkitAudioContext || window.AudioContext;
-// use a single audio context due to hardware limits
-var audioContext = null;
-module.exports = function(stream, options) {
-  var harker = new WildEmitter();
-
-
-  // make it not break in non-supported browsers
-  if (!audioContextType) return harker;
-
-  //Config
-  var options = options || {},
-      smoothing = (options.smoothing || 0.5),
-      interval = (options.interval || 100),
-      threshold = options.threshold,
-      play = options.play,
-      running = true;
-
-  //Setup Audio Context
-  if (!audioContext) {
-    audioContext = new audioContextType();
-  }
-  var sourceNode, fftBins, analyser;
-
-  analyser = audioContext.createAnalyser();
-  analyser.fftSize = 512;
-  analyser.smoothingTimeConstant = smoothing;
-  fftBins = new Float32Array(analyser.fftSize);
-
-  if (stream.jquery) stream = stream[0];
-  if (stream instanceof HTMLAudioElement) {
-    //Audio Tag
-    sourceNode = audioContext.createMediaElementSource(stream);
-    if (typeof play === 'undefined') play = true;
-    threshold = threshold || -65;
-  } else {
-    //WebRTC Stream
-    sourceNode = audioContext.createMediaStreamSource(stream);
-    threshold = threshold || -45;
-  }
-
-  sourceNode.connect(analyser);
-  if (play) analyser.connect(audioContext.destination);
-
-  harker.speaking = false;
-
-  harker.setThreshold = function(t) {
-    threshold = t;
-  };
-
-  harker.setInterval = function(i) {
-    interval = i;
-  };
-  
-  harker.stop = function() {
-    running = false;
-    harker.emit('volume_change', -100, threshold);
-    if (harker.speaking) {
-      harker.speaking = false;
-      harker.emit('stopped_speaking');
-    }
-  };
-
-  // Poll the analyser node to determine if speaking
-  // and emit events if changed
-  var looper = function() {
-    setTimeout(function() {
-    
-      //check if stop has been called
-      if(!running) {
-        return;
-      }
-      
-      var currentVolume = getMaxVolume(analyser, fftBins);
-
-      harker.emit('volume_change', currentVolume, threshold);
-
-      if (currentVolume > threshold) {
-        if (!harker.speaking) {
-          harker.speaking = true;
-          harker.emit('speaking');
-        }
-      } else {
-        if (harker.speaking) {
-          harker.speaking = false;
-          harker.emit('stopped_speaking');
-        }
-      }
-
-      looper();
-    }, interval);
-  };
-  looper();
-
-
-  return harker;
-}
-
-},{"wildemitter":3}],20:[function(require,module,exports){
-var tosdp = require('./lib/tosdp');
-var tojson = require('./lib/tojson');
+},{"sdp-jingle-json":18,"traceablepeerconnection":14,"underscore":15,"util":5,"webrtcsupport":22,"wildemitter":16}],18:[function(_dereq_,module,exports){
+var tosdp = _dereq_('./lib/tosdp');
+var tojson = _dereq_('./lib/tojson');
 
 
 exports.toSessionSDP = tosdp.toSessionSDP;
@@ -7850,550 +7045,7 @@ exports.toSessionJSON = tojson.toSessionJSON;
 exports.toMediaJSON = tojson.toMediaJSON;
 exports.toCandidateJSON = tojson.toCandidateJSON;
 
-},{"./lib/tojson":23,"./lib/tosdp":22}],22:[function(require,module,exports){
-var senders = {
-    'initiator': 'sendonly',
-    'responder': 'recvonly',
-    'both': 'sendrecv',
-    'none': 'inactive',
-    'sendonly': 'initator',
-    'recvonly': 'responder',
-    'sendrecv': 'both',
-    'inactive': 'none'
-};
-
-
-exports.toSessionSDP = function (session, sid, time) {
-    var sdp = [
-        'v=0',
-        'o=- ' + (sid || session.sid || Date.now()) + ' ' + (time || Date.now()) + ' IN IP4 0.0.0.0',
-        's=-',
-        't=0 0'
-    ];
-
-    var groups = session.groups || [];
-    groups.forEach(function (group) {
-        sdp.push('a=group:' + group.semantics + ' ' + group.contents.join(' '));
-    });
-
-    var contents = session.contents || [];
-    contents.forEach(function (content) {
-        sdp.push(exports.toMediaSDP(content));
-    });
-
-    return sdp.join('\r\n') + '\r\n';
-};
-
-exports.toMediaSDP = function (content) {
-    var sdp = [];
-
-    var desc = content.description;
-    var transport = content.transport;
-    var payloads = desc.payloads || [];
-    var fingerprints = (transport && transport.fingerprints) || [];
-
-    var mline = [desc.media, '1'];
-
-    if ((desc.encryption && desc.encryption.length > 0) || (fingerprints.length > 0)) {
-        mline.push('RTP/SAVPF');
-    } else {
-        mline.push('RTP/AVPF');
-    }
-    payloads.forEach(function (payload) {
-        mline.push(payload.id);
-    });
-
-
-    sdp.push('m=' + mline.join(' '));
-
-    sdp.push('c=IN IP4 0.0.0.0');
-    sdp.push('a=rtcp:1 IN IP4 0.0.0.0');
-
-    if (transport) {
-        if (transport.ufrag) {
-            sdp.push('a=ice-ufrag:' + transport.ufrag);
-        }
-        if (transport.pwd) {
-            sdp.push('a=ice-pwd:' + transport.pwd);
-        }
-        if (transport.setup) {
-            sdp.push('a=setup:' + transport.setup);
-        }
-        fingerprints.forEach(function (fingerprint) {
-            sdp.push('a=fingerprint:' + fingerprint.hash + ' ' + fingerprint.value);
-        });
-    }
-
-    sdp.push('a=' + (senders[content.senders] || 'sendrecv'));
-    sdp.push('a=mid:' + content.name);
-
-    if (desc.mux) {
-        sdp.push('a=rtcp-mux');
-    }
-
-    var encryption = desc.encryption || [];
-    encryption.forEach(function (crypto) {
-        sdp.push('a=crypto:' + crypto.tag + ' ' + crypto.cipherSuite + ' ' + crypto.keyParams + (crypto.sessionParams ? ' ' + crypto.sessionParams : ''));
-    });
-
-    payloads.forEach(function (payload) {
-        var rtpmap = 'a=rtpmap:' + payload.id + ' ' + payload.name + '/' + payload.clockrate;
-        if (payload.channels && payload.channels != '1') {
-            rtpmap += '/' + payload.channels;
-        }
-        sdp.push(rtpmap);
-
-        if (payload.parameters && payload.parameters.length) {
-            var fmtp = ['a=fmtp:' + payload.id];
-            payload.parameters.forEach(function (param) {
-                fmtp.push((param.key ? param.key + '=' : '') + param.value);
-            });
-            sdp.push(fmtp.join(' '));
-        }
-
-        if (payload.feedback) {
-            payload.feedback.forEach(function (fb) {
-                if (fb.type === 'trr-int') {
-                    sdp.push('a=rtcp-fb:' + payload.id + ' trr-int ' + fb.value ? fb.value : '0');
-                } else {
-                    sdp.push('a=rtcp-fb:' + payload.id + ' ' + fb.type + (fb.subtype ? ' ' + fb.subtype : ''));
-                }
-            });
-        }
-    });
-
-    if (desc.feedback) {
-        desc.feedback.forEach(function (fb) {
-            if (fb.type === 'trr-int') {
-                sdp.push('a=rtcp-fb:* trr-int ' + fb.value ? fb.value : '0');
-            } else {
-                sdp.push('a=rtcp-fb:* ' + fb.type + (fb.subtype ? ' ' + fb.subtype : ''));
-            }
-        });
-    }
-
-    var hdrExts = desc.headerExtensions || [];
-    hdrExts.forEach(function (hdr) {
-        sdp.push('a=extmap:' + hdr.id + (hdr.senders ? '/' + senders[hdr.senders] : '') + ' ' + hdr.uri);
-    });
-
-    var ssrcGroups = desc.sourceGroups || [];
-    ssrcGroups.forEach(function (ssrcGroup) {
-        sdp.push('a=ssrc-group:' + ssrcGroup.semantics + ' ' + ssrcGroup.sources.join(' '));
-    });
-
-    var ssrcs = desc.sources || [];
-    ssrcs.forEach(function (ssrc) {
-        for (var i = 0; i < ssrc.parameters.length; i++) {
-            var param = ssrc.parameters[i];
-            sdp.push('a=ssrc:' + (ssrc.ssrc || desc.ssrc) + ' ' + param.key + (param.value ? (':' + param.value) : ''));
-        }
-    });
-
-    var candidates = transport.candidates || [];
-    candidates.forEach(function (candidate) {
-        sdp.push(exports.toCandidateSDP(candidate));
-    });
-
-    return sdp.join('\r\n');
-};
-
-exports.toCandidateSDP = function (candidate) {
-    var sdp = [];
-
-    sdp.push(candidate.foundation);
-    sdp.push(candidate.component);
-    sdp.push(candidate.protocol);
-    sdp.push(candidate.priority);
-    sdp.push(candidate.ip);
-    sdp.push(candidate.port);
-
-    var type = candidate.type;
-    sdp.push('typ');
-    sdp.push(type);
-    if (type === 'srflx' || type === 'prflx' || type === 'relay') {
-        if (candidate.relAddr && candidate.relPort) {
-            sdp.push('raddr');
-            sdp.push(candidate.relAddr);
-            sdp.push('rport');
-            sdp.push(candidate.relPort);
-        }
-    }
-
-    sdp.push('generation');
-    sdp.push(candidate.generation || '0');
-
-    return 'a=candidate:' + sdp.join(' ');
-};
-
-},{}],19:[function(require,module,exports){
-// based on https://github.com/ESTOS/strophe.jingle/
-// adds wildemitter support
-var util = require('util');
-var webrtc = require('webrtcsupport');
-var WildEmitter = require('wildemitter');
-
-function dumpSDP(description) {
-    return 'type: ' + description.type + '\r\n' + description.sdp;
-}
-
-function TraceablePeerConnection(config, constraints) {
-    var self = this;
-    WildEmitter.call(this);
-
-    this.peerconnection = new webrtc.PeerConnection(config, constraints);
-
-    this.trace = function (what, info) {
-        self.emit('PeerConnectionTrace', {
-            time: new Date(),
-            type: what,
-            value: info || ""
-        });
-    };
-
-    this.onicecandidate = null;
-    this.peerconnection.onicecandidate = function (event) {
-        self.trace('onicecandidate', JSON.stringify(event.candidate, null, ' '));
-        if (self.onicecandidate !== null) {
-            self.onicecandidate(event);
-        }
-    };
-    this.onaddstream = null;
-    this.peerconnection.onaddstream = function (event) {
-        self.trace('onaddstream', event.stream.id);
-        if (self.onaddstream !== null) {
-            self.onaddstream(event);
-        }
-    };
-    this.onremovestream = null;
-    this.peerconnection.onremovestream = function (event) {
-        self.trace('onremovestream', event.stream.id);
-        if (self.onremovestream !== null) {
-            self.onremovestream(event);
-        }
-    };
-    this.onsignalingstatechange = null;
-    this.peerconnection.onsignalingstatechange = function (event) {
-        self.trace('onsignalingstatechange', self.signalingState);
-        if (self.onsignalingstatechange !== null) {
-            self.onsignalingstatechange(event);
-        }
-    };
-    this.oniceconnectionstatechange = null;
-    this.peerconnection.oniceconnectionstatechange = function (event) {
-        self.trace('oniceconnectionstatechange', self.iceConnectionState);
-        if (self.oniceconnectionstatechange !== null) {
-            self.oniceconnectionstatechange(event);
-        }
-    };
-    this.onnegotiationneeded = null;
-    this.peerconnection.onnegotiationneeded = function (event) {
-        self.trace('onnegotiationneeded');
-        if (self.onnegotiationneeded !== null) {
-            self.onnegotiationneeded(event);
-        }
-    };
-    self.ondatachannel = null;
-    this.peerconnection.ondatachannel = function (event) {
-        self.trace('ondatachannel', event);
-        if (self.ondatachannel !== null) {
-            self.ondatachannel(event);
-        }
-    };
-}
-
-util.inherits(TraceablePeerConnection, WildEmitter);
-
-if (TraceablePeerConnection.prototype.__defineGetter__ !== undefined) {
-    TraceablePeerConnection.prototype.__defineGetter__('signalingState', function () { return this.peerconnection.signalingState; });
-    TraceablePeerConnection.prototype.__defineGetter__('iceConnectionState', function () { return this.peerconnection.iceConnectionState; });
-    TraceablePeerConnection.prototype.__defineGetter__('localDescription', function () { return this.peerconnection.localDescription; });
-    TraceablePeerConnection.prototype.__defineGetter__('remoteDescription', function () { return this.peerconnection.remoteDescription; });
-}
-
-TraceablePeerConnection.prototype.addStream = function (stream) {
-    this.trace('addStream', stream.id);
-    this.peerconnection.addStream(stream);
-};
-
-TraceablePeerConnection.prototype.removeStream = function (stream) {
-    this.trace('removeStream', stream.id);
-    this.peerconnection.removeStream(stream);
-};
-
-TraceablePeerConnection.prototype.createDataChannel = function (label, opts) {
-    this.trace('createDataChannel', label, opts);
-    return this.peerconnection.createDataChannel(label, opts);
-};
-
-TraceablePeerConnection.prototype.setLocalDescription = function (description, successCallback, failureCallback) {
-    var self = this;
-    this.trace('setLocalDescription', dumpSDP(description));
-    this.peerconnection.setLocalDescription(description,
-        function () {
-            self.trace('setLocalDescriptionOnSuccess');
-            successCallback();
-        },
-        function (err) {
-            self.trace('setLocalDescriptionOnFailure', err);
-            failureCallback(err);
-        }
-    );
-};
-
-TraceablePeerConnection.prototype.setRemoteDescription = function (description, successCallback, failureCallback) {
-    var self = this;
-    this.trace('setRemoteDescription', dumpSDP(description));
-    this.peerconnection.setRemoteDescription(description,
-        function () {
-            self.trace('setRemoteDescriptionOnSuccess');
-            successCallback();
-        },
-        function (err) {
-            self.trace('setRemoteDescriptionOnFailure', err);
-            failureCallback(err);
-        }
-    );
-};
-
-TraceablePeerConnection.prototype.close = function () {
-    this.trace('stop');
-    if (this.statsinterval !== null) {
-        window.clearInterval(this.statsinterval);
-        this.statsinterval = null;
-    }
-    if (this.peerconnection.signalingState != 'closed') {
-        this.peerconnection.close();
-    }
-};
-
-TraceablePeerConnection.prototype.createOffer = function (successCallback, failureCallback, constraints) {
-    var self = this;
-    this.trace('createOffer', JSON.stringify(constraints, null, ' '));
-    this.peerconnection.createOffer(
-        function (offer) {
-            self.trace('createOfferOnSuccess', dumpSDP(offer));
-            successCallback(offer);
-        },
-        function (err) {
-            self.trace('createOfferOnFailure', err);
-            failureCallback(err);
-        },
-        constraints
-    );
-};
-
-TraceablePeerConnection.prototype.createAnswer = function (successCallback, failureCallback, constraints) {
-    var self = this;
-    this.trace('createAnswer', JSON.stringify(constraints, null, ' '));
-    this.peerconnection.createAnswer(
-        function (answer) {
-            self.trace('createAnswerOnSuccess', dumpSDP(answer));
-            successCallback(answer);
-        },
-        function (err) {
-            self.trace('createAnswerOnFailure', err);
-            failureCallback(err);
-        },
-        constraints
-    );
-};
-
-TraceablePeerConnection.prototype.addIceCandidate = function (candidate, successCallback, failureCallback) {
-    var self = this;
-    this.trace('addIceCandidate', JSON.stringify(candidate, null, ' '));
-    this.peerconnection.addIceCandidate(candidate);
-    /* maybe later
-    this.peerconnection.addIceCandidate(candidate, 
-        function () {                                
-            self.trace('addIceCandidateOnSuccess');
-            successCallback();
-        },
-        function (err) {
-            self.trace('addIceCandidateOnFailure', err);
-            failureCallback(err);
-        }
-    );
-    */
-};
-
-TraceablePeerConnection.prototype.getStats = function (callback, errback) {
-    if (navigator.mozGetUserMedia) {
-        // ignore for now...
-    } else {
-        this.peerconnection.getStats(callback);
-    }
-};
-
-module.exports = TraceablePeerConnection;
-
-},{"util":15,"webrtcsupport":11,"wildemitter":18}],23:[function(require,module,exports){
-var parsers = require('./parsers');
-var idCounter = Math.random();
-
-exports._setIdCounter = function (counter) {
-    idCounter = counter;
-};
-
-exports.toSessionJSON = function (sdp, creator) {
-    // Divide the SDP into session and media sections.
-    var media = sdp.split('\r\nm=');
-    for (var i = 1; i < media.length; i++) {
-        media[i] = 'm=' + media[i];
-        if (i !== media.length - 1) {
-            media[i] += '\r\n';
-        }
-    }
-    var session = media.shift() + '\r\n';
-    var sessionLines = parsers.lines(session);
-    var parsed = {};
-
-    var contents = [];
-    media.forEach(function (m) {
-        contents.push(exports.toMediaJSON(m, session, creator));
-    });
-    parsed.contents = contents;
-
-    var groupLines = parsers.findLines('a=group:', sessionLines);
-    if (groupLines.length) {
-        parsed.groups = parsers.groups(groupLines);
-    }
-
-    return parsed;
-};
-
-exports.toMediaJSON = function (media, session, creator) {
-    var lines = parsers.lines(media);
-    var sessionLines = parsers.lines(session);
-    var mline = parsers.mline(lines[0]);
-
-    var content = {
-        creator: creator,
-        name: mline.media,
-        description: {
-            descType: 'rtp',
-            media: mline.media,
-            payloads: [],
-            encryption: [],
-            feedback: [],
-            headerExtensions: []
-        },
-        transport: {
-            transType: 'iceUdp',
-            candidates: [],
-            fingerprints: []
-        }
-    };
-    var desc = content.description;
-    var trans = content.transport;
-
-    var ssrc = parsers.findLine('a=ssrc:', lines);
-    if (ssrc) {
-        desc.ssrc = ssrc.substr(7).split(' ')[0];
-    }
-
-    // If we have a mid, use that for the content name instead.
-    var mid = parsers.findLine('a=mid:', lines);
-    if (mid) {
-        content.name = mid.substr(6);
-    }
-
-    if (parsers.findLine('a=sendrecv', lines, sessionLines)) {
-        content.senders = 'both';
-    } else if (parsers.findLine('a=sendonly', lines, sessionLines)) {
-        content.senders = 'initiator';
-    } else if (parsers.findLine('a=recvonly', lines, sessionLines)) {
-        content.senders = 'responder';
-    } else if (parsers.findLine('a=inactive', lines, sessionLines)) {
-        content.senders = 'none';
-    }
-
-    var rtpmapLines = parsers.findLines('a=rtpmap:', lines);
-    rtpmapLines.forEach(function (line) {
-        var payload = parsers.rtpmap(line);
-        payload.feedback = [];
-
-        var fmtpLines = parsers.findLines('a=fmtp:' + payload.id, lines);
-        fmtpLines.forEach(function (line) {
-            payload.parameters = parsers.fmtp(line);
-        });
-
-        var fbLines = parsers.findLines('a=rtcp-fb:' + payload.id, lines);
-        fbLines.forEach(function (line) {
-            payload.feedback.push(parsers.rtcpfb(line));
-        });
-
-        desc.payloads.push(payload);
-    });
-
-    var cryptoLines = parsers.findLines('a=crypto:', lines, sessionLines);
-    cryptoLines.forEach(function (line) {
-        desc.encryption.push(parsers.crypto(line));
-    });
-
-    if (parsers.findLine('a=rtcp-mux', lines)) {
-        desc.mux = true;
-    }
-
-    var fbLines = parsers.findLines('a=rtcp-fb:*', lines);
-    fbLines.forEach(function (line) {
-        desc.feedback.push(parsers.rtcpfb(line));
-    });
-
-    var extLines = parsers.findLines('a=extmap:', lines);
-    extLines.forEach(function (line) {
-        var ext = parsers.extmap(line);
-
-        var senders = {
-            sendonly: 'responder',
-            recvonly: 'initiator',
-            sendrecv: 'both',
-            inactive: 'none'
-        };
-        ext.senders = senders[ext.senders];
-
-        desc.headerExtensions.push(ext);
-    });
-
-    var ssrcGroupLines = parsers.findLines('a=ssrc-group:', lines);
-    desc.sourceGroups = parsers.sourceGroups(ssrcGroupLines || []);
-
-    var ssrcLines = parsers.findLines('a=ssrc:', lines);
-    desc.sources = parsers.sources(ssrcLines || []);
-
-    var fingerprintLines = parsers.findLines('a=fingerprint:', lines, sessionLines);
-    fingerprintLines.forEach(function (line) {
-        var fp = parsers.fingerprint(line);
-        var setup = parsers.findLine('a=setup:', lines, sessionLines);
-        if (setup) {
-            fp.setup = setup.substr(8);
-        }
-        trans.fingerprints.push(fp);
-    });
-
-    var ufragLine = parsers.findLine('a=ice-ufrag:', lines, sessionLines);
-    var pwdLine = parsers.findLine('a=ice-pwd:', lines, sessionLines);
-    if (ufragLine && pwdLine) {
-        trans.ufrag = ufragLine.substr(12);
-        trans.pwd = pwdLine.substr(10);
-        trans.candidates = [];
-
-        var candidateLines = parsers.findLines('a=candidate:', lines, sessionLines);
-        candidateLines.forEach(function (line) {
-            trans.candidates.push(exports.toCandidateJSON(line));
-        });
-    }
-
-    return content;
-};
-
-exports.toCandidateJSON = function (line) {
-    var candidate = parsers.candidate(line.split('\r\n')[0]);
-    candidate.id = (idCounter++).toString(36).substr(0, 12);
-    return candidate;
-};
-
-},{"./parsers":24}],24:[function(require,module,exports){
+},{"./lib/tojson":20,"./lib/tosdp":21}],19:[function(_dereq_,module,exports){
 exports.lines = function (sdp) {
     return sdp.split('\r\n').filter(function (line) {
         return line.length > 0;
@@ -8627,6 +7279,1449 @@ exports.groups = function (lines) {
     return parsed;
 };
 
-},{}]},{},[1])(1)
+},{}],20:[function(_dereq_,module,exports){
+var parsers = _dereq_('./parsers');
+var idCounter = Math.random();
+
+exports._setIdCounter = function (counter) {
+    idCounter = counter;
+};
+
+exports.toSessionJSON = function (sdp, creator) {
+    // Divide the SDP into session and media sections.
+    var media = sdp.split('\r\nm=');
+    for (var i = 1; i < media.length; i++) {
+        media[i] = 'm=' + media[i];
+        if (i !== media.length - 1) {
+            media[i] += '\r\n';
+        }
+    }
+    var session = media.shift() + '\r\n';
+    var sessionLines = parsers.lines(session);
+    var parsed = {};
+
+    var contents = [];
+    media.forEach(function (m) {
+        contents.push(exports.toMediaJSON(m, session, creator));
+    });
+    parsed.contents = contents;
+
+    var groupLines = parsers.findLines('a=group:', sessionLines);
+    if (groupLines.length) {
+        parsed.groups = parsers.groups(groupLines);
+    }
+
+    return parsed;
+};
+
+exports.toMediaJSON = function (media, session, creator) {
+    var lines = parsers.lines(media);
+    var sessionLines = parsers.lines(session);
+    var mline = parsers.mline(lines[0]);
+
+    var content = {
+        creator: creator,
+        name: mline.media,
+        description: {
+            descType: 'rtp',
+            media: mline.media,
+            payloads: [],
+            encryption: [],
+            feedback: [],
+            headerExtensions: []
+        },
+        transport: {
+            transType: 'iceUdp',
+            candidates: [],
+            fingerprints: []
+        }
+    };
+    var desc = content.description;
+    var trans = content.transport;
+
+    var ssrc = parsers.findLine('a=ssrc:', lines);
+    if (ssrc) {
+        desc.ssrc = ssrc.substr(7).split(' ')[0];
+    }
+
+    // If we have a mid, use that for the content name instead.
+    var mid = parsers.findLine('a=mid:', lines);
+    if (mid) {
+        content.name = mid.substr(6);
+    }
+
+    if (parsers.findLine('a=sendrecv', lines, sessionLines)) {
+        content.senders = 'both';
+    } else if (parsers.findLine('a=sendonly', lines, sessionLines)) {
+        content.senders = 'initiator';
+    } else if (parsers.findLine('a=recvonly', lines, sessionLines)) {
+        content.senders = 'responder';
+    } else if (parsers.findLine('a=inactive', lines, sessionLines)) {
+        content.senders = 'none';
+    }
+
+    var rtpmapLines = parsers.findLines('a=rtpmap:', lines);
+    rtpmapLines.forEach(function (line) {
+        var payload = parsers.rtpmap(line);
+        payload.feedback = [];
+
+        var fmtpLines = parsers.findLines('a=fmtp:' + payload.id, lines);
+        fmtpLines.forEach(function (line) {
+            payload.parameters = parsers.fmtp(line);
+        });
+
+        var fbLines = parsers.findLines('a=rtcp-fb:' + payload.id, lines);
+        fbLines.forEach(function (line) {
+            payload.feedback.push(parsers.rtcpfb(line));
+        });
+
+        desc.payloads.push(payload);
+    });
+
+    var cryptoLines = parsers.findLines('a=crypto:', lines, sessionLines);
+    cryptoLines.forEach(function (line) {
+        desc.encryption.push(parsers.crypto(line));
+    });
+
+    if (parsers.findLine('a=rtcp-mux', lines)) {
+        desc.mux = true;
+    }
+
+    var fbLines = parsers.findLines('a=rtcp-fb:*', lines);
+    fbLines.forEach(function (line) {
+        desc.feedback.push(parsers.rtcpfb(line));
+    });
+
+    var extLines = parsers.findLines('a=extmap:', lines);
+    extLines.forEach(function (line) {
+        var ext = parsers.extmap(line);
+
+        var senders = {
+            sendonly: 'responder',
+            recvonly: 'initiator',
+            sendrecv: 'both',
+            inactive: 'none'
+        };
+        ext.senders = senders[ext.senders];
+
+        desc.headerExtensions.push(ext);
+    });
+
+    var ssrcGroupLines = parsers.findLines('a=ssrc-group:', lines);
+    desc.sourceGroups = parsers.sourceGroups(ssrcGroupLines || []);
+
+    var ssrcLines = parsers.findLines('a=ssrc:', lines);
+    desc.sources = parsers.sources(ssrcLines || []);
+
+    var fingerprintLines = parsers.findLines('a=fingerprint:', lines, sessionLines);
+    fingerprintLines.forEach(function (line) {
+        var fp = parsers.fingerprint(line);
+        var setup = parsers.findLine('a=setup:', lines, sessionLines);
+        if (setup) {
+            fp.setup = setup.substr(8);
+        }
+        trans.fingerprints.push(fp);
+    });
+
+    var ufragLine = parsers.findLine('a=ice-ufrag:', lines, sessionLines);
+    var pwdLine = parsers.findLine('a=ice-pwd:', lines, sessionLines);
+    if (ufragLine && pwdLine) {
+        trans.ufrag = ufragLine.substr(12);
+        trans.pwd = pwdLine.substr(10);
+        trans.candidates = [];
+
+        var candidateLines = parsers.findLines('a=candidate:', lines, sessionLines);
+        candidateLines.forEach(function (line) {
+            trans.candidates.push(exports.toCandidateJSON(line));
+        });
+    }
+
+    return content;
+};
+
+exports.toCandidateJSON = function (line) {
+    var candidate = parsers.candidate(line.split('\r\n')[0]);
+    candidate.id = (idCounter++).toString(36).substr(0, 12);
+    return candidate;
+};
+
+},{"./parsers":19}],21:[function(_dereq_,module,exports){
+var senders = {
+    'initiator': 'sendonly',
+    'responder': 'recvonly',
+    'both': 'sendrecv',
+    'none': 'inactive',
+    'sendonly': 'initator',
+    'recvonly': 'responder',
+    'sendrecv': 'both',
+    'inactive': 'none'
+};
+
+
+exports.toSessionSDP = function (session, sid, time) {
+    var sdp = [
+        'v=0',
+        'o=- ' + (sid || session.sid || Date.now()) + ' ' + (time || Date.now()) + ' IN IP4 0.0.0.0',
+        's=-',
+        't=0 0'
+    ];
+
+    var groups = session.groups || [];
+    groups.forEach(function (group) {
+        sdp.push('a=group:' + group.semantics + ' ' + group.contents.join(' '));
+    });
+
+    var contents = session.contents || [];
+    contents.forEach(function (content) {
+        sdp.push(exports.toMediaSDP(content));
+    });
+
+    return sdp.join('\r\n') + '\r\n';
+};
+
+exports.toMediaSDP = function (content) {
+    var sdp = [];
+
+    var desc = content.description;
+    var transport = content.transport;
+    var payloads = desc.payloads || [];
+    var fingerprints = (transport && transport.fingerprints) || [];
+
+    var mline = [desc.media, '1'];
+
+    if ((desc.encryption && desc.encryption.length > 0) || (fingerprints.length > 0)) {
+        mline.push('RTP/SAVPF');
+    } else {
+        mline.push('RTP/AVPF');
+    }
+    payloads.forEach(function (payload) {
+        mline.push(payload.id);
+    });
+
+
+    sdp.push('m=' + mline.join(' '));
+
+    sdp.push('c=IN IP4 0.0.0.0');
+    sdp.push('a=rtcp:1 IN IP4 0.0.0.0');
+
+    if (transport) {
+        if (transport.ufrag) {
+            sdp.push('a=ice-ufrag:' + transport.ufrag);
+        }
+        if (transport.pwd) {
+            sdp.push('a=ice-pwd:' + transport.pwd);
+        }
+        if (transport.setup) {
+            sdp.push('a=setup:' + transport.setup);
+        }
+        fingerprints.forEach(function (fingerprint) {
+            sdp.push('a=fingerprint:' + fingerprint.hash + ' ' + fingerprint.value);
+        });
+    }
+
+    sdp.push('a=' + (senders[content.senders] || 'sendrecv'));
+    sdp.push('a=mid:' + content.name);
+
+    if (desc.mux) {
+        sdp.push('a=rtcp-mux');
+    }
+
+    var encryption = desc.encryption || [];
+    encryption.forEach(function (crypto) {
+        sdp.push('a=crypto:' + crypto.tag + ' ' + crypto.cipherSuite + ' ' + crypto.keyParams + (crypto.sessionParams ? ' ' + crypto.sessionParams : ''));
+    });
+
+    payloads.forEach(function (payload) {
+        var rtpmap = 'a=rtpmap:' + payload.id + ' ' + payload.name + '/' + payload.clockrate;
+        if (payload.channels && payload.channels != '1') {
+            rtpmap += '/' + payload.channels;
+        }
+        sdp.push(rtpmap);
+
+        if (payload.parameters && payload.parameters.length) {
+            var fmtp = ['a=fmtp:' + payload.id];
+            payload.parameters.forEach(function (param) {
+                fmtp.push((param.key ? param.key + '=' : '') + param.value);
+            });
+            sdp.push(fmtp.join(' '));
+        }
+
+        if (payload.feedback) {
+            payload.feedback.forEach(function (fb) {
+                if (fb.type === 'trr-int') {
+                    sdp.push('a=rtcp-fb:' + payload.id + ' trr-int ' + fb.value ? fb.value : '0');
+                } else {
+                    sdp.push('a=rtcp-fb:' + payload.id + ' ' + fb.type + (fb.subtype ? ' ' + fb.subtype : ''));
+                }
+            });
+        }
+    });
+
+    if (desc.feedback) {
+        desc.feedback.forEach(function (fb) {
+            if (fb.type === 'trr-int') {
+                sdp.push('a=rtcp-fb:* trr-int ' + fb.value ? fb.value : '0');
+            } else {
+                sdp.push('a=rtcp-fb:* ' + fb.type + (fb.subtype ? ' ' + fb.subtype : ''));
+            }
+        });
+    }
+
+    var hdrExts = desc.headerExtensions || [];
+    hdrExts.forEach(function (hdr) {
+        sdp.push('a=extmap:' + hdr.id + (hdr.senders ? '/' + senders[hdr.senders] : '') + ' ' + hdr.uri);
+    });
+
+    var ssrcGroups = desc.sourceGroups || [];
+    ssrcGroups.forEach(function (ssrcGroup) {
+        sdp.push('a=ssrc-group:' + ssrcGroup.semantics + ' ' + ssrcGroup.sources.join(' '));
+    });
+
+    var ssrcs = desc.sources || [];
+    ssrcs.forEach(function (ssrc) {
+        for (var i = 0; i < ssrc.parameters.length; i++) {
+            var param = ssrc.parameters[i];
+            sdp.push('a=ssrc:' + (ssrc.ssrc || desc.ssrc) + ' ' + param.key + (param.value ? (':' + param.value) : ''));
+        }
+    });
+
+    var candidates = transport.candidates || [];
+    candidates.forEach(function (candidate) {
+        sdp.push(exports.toCandidateSDP(candidate));
+    });
+
+    return sdp.join('\r\n');
+};
+
+exports.toCandidateSDP = function (candidate) {
+    var sdp = [];
+
+    sdp.push(candidate.foundation);
+    sdp.push(candidate.component);
+    sdp.push(candidate.protocol);
+    sdp.push(candidate.priority);
+    sdp.push(candidate.ip);
+    sdp.push(candidate.port);
+
+    var type = candidate.type;
+    sdp.push('typ');
+    sdp.push(type);
+    if (type === 'srflx' || type === 'prflx' || type === 'relay') {
+        if (candidate.relAddr && candidate.relPort) {
+            sdp.push('raddr');
+            sdp.push(candidate.relAddr);
+            sdp.push('rport');
+            sdp.push(candidate.relPort);
+        }
+    }
+
+    sdp.push('generation');
+    sdp.push(candidate.generation || '0');
+
+    return 'a=candidate:' + sdp.join(' ');
+};
+
+},{}],22:[function(_dereq_,module,exports){
+// created by @HenrikJoreteg
+var prefix;
+var isChrome = false;
+var isFirefox = false;
+var ua = navigator.userAgent.toLowerCase();
+
+// basic sniffing
+if (ua.indexOf('firefox') !== -1) {
+    prefix = 'moz';
+    isFirefox = true;
+} else if (ua.indexOf('chrome') !== -1) {
+    prefix = 'webkit';
+    isChrome = true;
+}
+
+var PC = window.mozRTCPeerConnection || window.webkitRTCPeerConnection;
+var IceCandidate = window.mozRTCIceCandidate || window.RTCIceCandidate;
+var SessionDescription = window.mozRTCSessionDescription || window.RTCSessionDescription;
+var MediaStream = window.webkitMediaStream || window.MediaStream;
+var screenSharing = navigator.userAgent.match('Chrome') && parseInt(navigator.userAgent.match(/Chrome\/(.*) /)[1], 10) >= 26;
+var AudioContext = window.webkitAudioContext || window.AudioContext;
+
+
+// export support flags and constructors.prototype && PC
+module.exports = {
+    support: !!PC,
+    dataChannel: isChrome || isFirefox || (PC && PC.prototype && PC.prototype.createDataChannel),
+    prefix: prefix,
+    webAudio: !!(AudioContext && AudioContext.prototype.createMediaStreamSource),
+    mediaStream: !!(MediaStream && MediaStream.prototype.removeTrack),
+    screenSharing: !!screenSharing,
+    AudioContext: AudioContext,
+    PeerConnection: PC,
+    SessionDescription: SessionDescription,
+    IceCandidate: IceCandidate
+};
+
+},{}],23:[function(_dereq_,module,exports){
+/*
+WildEmitter.js is a slim little event emitter by @henrikjoreteg largely based 
+on @visionmedia's Emitter from UI Kit.
+
+Why? I wanted it standalone.
+
+I also wanted support for wildcard emitters like this:
+
+emitter.on('*', function (eventName, other, event, payloads) {
+    
 });
-;
+
+emitter.on('somenamespace*', function (eventName, payloads) {
+    
+});
+
+Please note that callbacks triggered by wildcard registered events also get 
+the event name as the first argument.
+*/
+module.exports = WildEmitter;
+
+function WildEmitter() {
+    this.callbacks = {};
+}
+
+// Listen on the given `event` with `fn`. Store a group name if present.
+WildEmitter.prototype.on = function (event, groupName, fn) {
+    var hasGroup = (arguments.length === 3),
+        group = hasGroup ? arguments[1] : undefined, 
+        func = hasGroup ? arguments[2] : arguments[1];
+    func._groupName = group;
+    (this.callbacks[event] = this.callbacks[event] || []).push(func);
+    return this;
+};
+
+// Adds an `event` listener that will be invoked a single
+// time then automatically removed.
+WildEmitter.prototype.once = function (event, groupName, fn) {
+    var self = this,
+        hasGroup = (arguments.length === 3),
+        group = hasGroup ? arguments[1] : undefined, 
+        func = hasGroup ? arguments[2] : arguments[1];
+    function on() {
+        self.off(event, on);
+        func.apply(this, arguments);
+    }
+    this.on(event, group, on);
+    return this;
+};
+
+// Unbinds an entire group
+WildEmitter.prototype.releaseGroup = function (groupName) {
+    var item, i, len, handlers;
+    for (item in this.callbacks) {
+        handlers = this.callbacks[item];
+        for (i = 0, len = handlers.length; i < len; i++) {
+            if (handlers[i]._groupName === groupName) {
+                //console.log('removing');
+                // remove it and shorten the array we're looping through
+                handlers.splice(i, 1);
+                i--;
+                len--;
+            }
+        }
+    }
+    return this;
+};
+
+// Remove the given callback for `event` or all
+// registered callbacks.
+WildEmitter.prototype.off = function (event, fn) {
+    var callbacks = this.callbacks[event],
+        i;
+    
+    if (!callbacks) return this;
+
+    // remove all handlers
+    if (arguments.length === 1) {
+        delete this.callbacks[event];
+        return this;
+    }
+
+    // remove specific handler
+    i = callbacks.indexOf(fn);
+    callbacks.splice(i, 1);
+    return this;
+};
+
+// Emit `event` with the given args.
+// also calls any `*` handlers
+WildEmitter.prototype.emit = function (event) {
+    var args = [].slice.call(arguments, 1),
+        callbacks = this.callbacks[event],
+        specialCallbacks = this.getWildcardCallbacks(event),
+        i,
+        len,
+        item;
+
+    if (callbacks) {
+        for (i = 0, len = callbacks.length; i < len; ++i) {
+            if (callbacks[i]) {
+                callbacks[i].apply(this, args);
+            } else {
+                break;
+            }
+        }
+    }
+
+    if (specialCallbacks) {
+        for (i = 0, len = specialCallbacks.length; i < len; ++i) {
+            if (specialCallbacks[i]) {
+                specialCallbacks[i].apply(this, [event].concat(args));
+            } else {
+                break;
+            }
+        }
+    }
+
+    return this;
+};
+
+// Helper for for finding special wildcard event handlers that match the event
+WildEmitter.prototype.getWildcardCallbacks = function (eventName) {
+    var item,
+        split,
+        result = [];
+
+    for (item in this.callbacks) {
+        split = item.split('*');
+        if (item === '*' || (split.length === 2 && eventName.slice(0, split[1].length) === split[1])) {
+            result = result.concat(this.callbacks[item]);
+        }
+    }
+    return result;
+};
+
+},{}],24:[function(_dereq_,module,exports){
+var webrtc = _dereq_('webrtcsupport');
+var getUserMedia = _dereq_('getusermedia');
+var PeerConnection = _dereq_('rtcpeerconnection');
+var WildEmitter = _dereq_('wildemitter');
+var hark = _dereq_('hark');
+var GainController = _dereq_('mediastream-gain');
+var mockconsole = _dereq_('mockconsole');
+
+
+function WebRTC(opts) {
+    var self = this;
+    var options = opts || {};
+    var config = this.config = {
+            debug: false,
+            localVideoEl: '',
+            remoteVideosEl: '',
+            autoRequestMedia: false,
+            // makes the entire PC config overridable
+            peerConnectionConfig: {
+                iceServers: [{"url": "stun:stun.l.google.com:19302"}]
+            },
+            peerConnectionContraints: {
+                optional: [
+                    {DtlsSrtpKeyAgreement: true}
+                ]
+            },
+            autoAdjustMic: false,
+            media: {
+                audio: true,
+                video: true
+            },
+            receiveMedia: {
+                mandatory: {
+                    OfferToReceiveAudio: true,
+                    OfferToReceiveVideo: true
+                }
+            },
+            detectSpeakingEvents: true,
+            enableDataChannels: true
+        };
+    var item, connection;
+
+    // expose screensharing check
+    this.screenSharingSupport = webrtc.screenSharing;
+
+    // We also allow a 'logger' option. It can be any object that implements
+    // log, warn, and error methods.
+    // We log nothing by default, following "the rule of silence":
+    // http://www.linfo.org/rule_of_silence.html
+    this.logger = function () {
+        // we assume that if you're in debug mode and you didn't
+        // pass in a logger, you actually want to log as much as
+        // possible.
+        if (opts.debug) {
+            return opts.logger || console;
+        } else {
+        // or we'll use your logger which should have its own logic
+        // for output. Or we'll return the no-op.
+            return opts.logger || mockconsole;
+        }
+    }();
+
+    // set options
+    for (item in options) {
+        this.config[item] = options[item];
+    }
+
+    // check for support
+    if (!webrtc.support) {
+        this.logger.error('Your browser doesn\'t seem to support WebRTC');
+    }
+
+    // where we'll store our peer connections
+    this.peers = [];
+
+    WildEmitter.call(this);
+
+    // log events in debug mode
+    if (this.config.debug) {
+        this.on('*', function (event, val1, val2) {
+            var logger;
+            // if you didn't pass in a logger and you explicitly turning on debug
+            // we're just going to assume you're wanting log output with console
+            if (self.config.logger === mockconsole) {
+                logger = console;
+            } else {
+                logger = self.logger;
+            }
+            logger.log('event:', event, val1, val2);
+        });
+    }
+}
+
+WebRTC.prototype = Object.create(WildEmitter.prototype, {
+    constructor: {
+        value: WebRTC
+    }
+});
+
+WebRTC.prototype.createPeer = function (opts) {
+    var peer;
+    opts.parent = this;
+    peer = new Peer(opts);
+    this.peers.push(peer);
+    return peer;
+};
+
+WebRTC.prototype.startLocalMedia = function (mediaConstraints, cb) {
+    var self = this;
+    var constraints = mediaConstraints || {video: true, audio: true};
+
+    getUserMedia(constraints, function (err, stream) {
+        if (!err) {
+            if (constraints.audio && self.config.detectSpeakingEvents) {
+                self.setupAudioMonitor(stream);
+            }
+            self.localStream = stream;
+
+            if (self.config.autoAdjustMic) {
+                self.gainController = new GainController(stream);
+                // start out somewhat muted if we can track audio
+                self.setMicIfEnabled(0.5);
+            }
+
+            self.emit('localStream', stream);
+        }
+        if (cb) cb(err, stream);
+    });
+};
+
+WebRTC.prototype.stopLocalMedia = function () {
+    if (this.localStream) {
+        this.localStream.stop();
+        this.emit('localStreamStopped');
+    }
+};
+
+// Audio controls
+WebRTC.prototype.mute = function () {
+    this._audioEnabled(false);
+    this.hardMuted = true;
+    this.emit('audioOff');
+};
+WebRTC.prototype.unmute = function () {
+    this._audioEnabled(true);
+    this.hardMuted = false;
+    this.emit('audioOn');
+};
+
+// Audio monitor
+WebRTC.prototype.setupAudioMonitor = function (stream) {
+    this.logger.log('Setup audio');
+    var audio = hark(stream);
+    var self = this;
+    var timeout;
+
+    audio.on('speaking', function () {
+        self.emit('speaking');
+        if (self.hardMuted) return;
+        self.setMicIfEnabled(1);
+        self.sendToAll('speaking', {});
+    });
+
+    audio.on('stopped_speaking', function () {
+        if (timeout) clearTimeout(timeout);
+
+        timeout = setTimeout(function () {
+            self.emit('stoppedSpeaking');
+            if (self.hardMuted) return;
+            self.setMicIfEnabled(0.5);
+            self.sendToAll('stopped_speaking', {});
+        }, 1000);
+    });
+    if (this.config.enableDataChannels) {
+        // until https://code.google.com/p/chromium/issues/detail?id=121673 is fixed...
+        audio.on('volume_change', function (volume, treshold) {
+            self.emit('volumeChange', volume, treshold);
+            if (self.hardMuted) return;
+            // FIXME: should use sendDirectlyToAll, but currently has different semantics wrt payload
+            self.peers.forEach(function (peer) {
+                if (peer.enableDataChannels) {
+                    var dc = peer.getDataChannel('hark');
+                    if (dc.readyState != 'open') return;
+                    dc.send(JSON.stringify({type: 'volume', volume: volume }));
+                }
+            });
+        });
+    }
+};
+
+// We do this as a seperate method in order to
+// still leave the "setMicVolume" as a working
+// method.
+WebRTC.prototype.setMicIfEnabled = function (volume) {
+    if (!this.config.autoAdjustMic) return;
+    this.gainController.setGain(volume);
+};
+
+// Video controls
+WebRTC.prototype.pauseVideo = function () {
+    this._videoEnabled(false);
+    this.emit('videoOff');
+};
+WebRTC.prototype.resumeVideo = function () {
+    this._videoEnabled(true);
+    this.emit('videoOn');
+};
+
+// Combined controls
+WebRTC.prototype.pause = function () {
+    this._audioEnabled(false);
+    this.pauseVideo();
+};
+WebRTC.prototype.resume = function () {
+    this._audioEnabled(true);
+    this.resumeVideo();
+};
+
+// Internal methods for enabling/disabling audio/video
+WebRTC.prototype._audioEnabled = function (bool) {
+    // work around for chrome 27 bug where disabling tracks
+    // doesn't seem to work (works in canary, remove when working)
+    this.setMicIfEnabled(bool ? 1 : 0);
+    this.localStream.getAudioTracks().forEach(function (track) {
+        track.enabled = !!bool;
+    });
+};
+WebRTC.prototype._videoEnabled = function (bool) {
+    this.localStream.getVideoTracks().forEach(function (track) {
+        track.enabled = !!bool;
+    });
+};
+
+// removes peers
+WebRTC.prototype.removePeers = function (id, type) {
+    this.getPeers(id, type).forEach(function (peer) {
+        peer.end();
+    });
+};
+
+// fetches all Peer objects by session id and/or type
+WebRTC.prototype.getPeers = function (sessionId, type) {
+    return this.peers.filter(function (peer) {
+        return (!sessionId || peer.id === sessionId) && (!type || peer.type === type);
+    });
+};
+
+// sends message to all
+WebRTC.prototype.sendToAll = function (message, payload) {
+    this.peers.forEach(function (peer) {
+        peer.send(message, payload);
+    });
+};
+
+// sends message to all using a datachannel
+// only sends to anyone who has an open datachannel
+WebRTC.prototype.sendDirectlyToAll = function (channel, message, payload) {
+    this.peers.forEach(function (peer) {
+        if (peer.enableDataChannels) {
+            peer.sendDirectly(channel, message, payload);
+        }
+    });
+};
+
+function Peer(options) {
+    var self = this;
+
+    this.id = options.id;
+    this.parent = options.parent;
+    this.type = options.type || 'video';
+    this.oneway = options.oneway || false;
+    this.sharemyscreen = options.sharemyscreen || false;
+    this.browserPrefix = options.prefix;
+    this.stream = options.stream;
+    this.enableDataChannels = options.enableDataChannels === undefined ? this.parent.config.enableDataChannels : options.enableDataChannels;
+    this.receiveMedia = options.receiveMedia || this.parent.config.receiveMedia;
+    this.channels = {};
+    // Create an RTCPeerConnection via the polyfill
+    this.pc = new PeerConnection(this.parent.config.peerConnectionConfig, this.parent.config.peerConnectionContraints);
+    this.pc.on('ice', this.onIceCandidate.bind(this));
+    this.pc.on('addStream', this.handleRemoteStreamAdded.bind(this));
+    this.pc.on('addChannel', this.handleDataChannelAdded.bind(this));
+    this.pc.on('removeStream', this.handleStreamRemoved.bind(this));
+    // Just fire negotiation needed events for now
+    // When browser re-negotiation handling seems to work
+    // we can use this as the trigger for starting the offer/answer process
+    // automatically. We'll just leave it be for now while this stabalizes.
+    this.pc.on('negotiationNeeded', this.emit.bind(this, 'negotiationNeeded'));
+    this.pc.on('iceConnectionStateChange', this.emit.bind(this, 'iceConnectionStateChange'));
+    this.pc.on('signalingStateChange', this.emit.bind(this, 'signalingStateChange'));
+    this.logger = this.parent.logger;
+
+    // handle screensharing/broadcast mode
+    if (options.type === 'screen') {
+        if (this.parent.localScreen && this.sharemyscreen) {
+            this.logger.log('adding local screen stream to peer connection');
+            this.pc.addStream(this.parent.localScreen);
+            this.broadcaster = options.broadcaster;
+        }
+    } else {
+        this.pc.addStream(this.parent.localStream);
+    }
+
+    // call emitter constructor
+    WildEmitter.call(this);
+
+    // proxy events to parent
+    this.on('*', function () {
+        self.parent.emit.apply(self.parent, arguments);
+    });
+}
+
+Peer.prototype = Object.create(WildEmitter.prototype, {
+    constructor: {
+        value: Peer
+    }
+});
+
+Peer.prototype.handleMessage = function (message) {
+    var self = this;
+
+    this.logger.log('getting', message.type, message);
+
+    if (message.prefix) this.browserPrefix = message.prefix;
+
+    if (message.type === 'offer') {
+        this.pc.handleOffer(message.payload, function (err) {
+            if (err) {
+                return;
+            }
+            // auto-accept
+            self.pc.answer(self.receiveMedia, function (err, sessionDescription) {
+                self.send('answer', sessionDescription);
+            });
+        });
+    } else if (message.type === 'answer') {
+        this.pc.handleAnswer(message.payload);
+    } else if (message.type === 'candidate') {
+        this.pc.processIce(message.payload);
+    } else if (message.type === 'speaking') {
+        this.parent.emit('speaking', {id: message.from});
+    } else if (message.type === 'stopped_speaking') {
+        this.parent.emit('stopped_speaking', {id: message.from});
+    } else if (message.type === 'mute') {
+        this.parent.emit('mute', {id: message.from, name: message.payload.name});
+    } else if (message.type === 'unmute') {
+        this.parent.emit('unmute', {id: message.from, name: message.payload.name});
+    }
+};
+
+// send via signalling channel
+Peer.prototype.send = function (messageType, payload) {
+    var message = {
+        to: this.id,
+        broadcaster: this.broadcaster,
+        roomType: this.type,
+        type: messageType,
+        payload: payload,
+        prefix: webrtc.prefix
+    };
+    this.logger.log('sending', messageType, message);
+    this.parent.emit('message', message);
+};
+
+// send via data channel
+// returns true when message was sent and false if channel is not open
+Peer.prototype.sendDirectly = function (channel, messageType, payload) {
+    var message = {
+        type: messageType,
+        payload: payload
+    };
+    this.logger.log('sending via datachannel', channel, messageType, message);
+    var dc = this.getDataChannel(channel);
+    if (dc.readyState != 'open') return false;
+    dc.send(JSON.stringify(message));
+    return true;
+};
+
+// Internal method registering handlers for a data channel and emitting events on the peer
+Peer.prototype._observeDataChannel = function (channel) {
+    var self = this;
+    channel.onclose = this.emit.bind(this, 'channelClose', channel);
+    channel.onerror = this.emit.bind(this, 'channelError', channel);
+    channel.onmessage = function (event) {
+        self.emit('channelMessage', self, channel.label, JSON.parse(event.data), channel, event);
+    };
+    channel.onopen = this.emit.bind(this, 'channelOpen', channel);
+};
+
+// Fetch or create a data channel by the given name
+Peer.prototype.getDataChannel = function (name, opts) {
+    if (!webrtc.dataChannel) return this.emit('error', new Error('createDataChannel not supported'));
+    var channel = this.channels[name];
+    opts || (opts = {});
+    if (channel) return channel;
+    // if we don't have one by this label, create it
+    channel = this.channels[name] = this.pc.createDataChannel(name, opts);
+    this._observeDataChannel(channel);
+    return channel;
+};
+
+Peer.prototype.onIceCandidate = function (candidate) {
+    if (this.closed) return;
+    if (candidate) {
+        this.send('candidate', candidate);
+    } else {
+        this.logger.log("End of candidates.");
+    }
+};
+
+Peer.prototype.start = function () {
+    var self = this;
+
+    // well, the webrtc api requires that we either
+    // a) create a datachannel a priori
+    // b) do a renegotiation later to add the SCTP m-line
+    // Let's do (a) first...
+    if (this.enableDataChannels) {
+        this.getDataChannel('simplewebrtc');
+    }
+
+    this.pc.offer(this.receiveMedia, function (err, sessionDescription) {
+        self.send('offer', sessionDescription);
+    });
+};
+
+Peer.prototype.end = function () {
+    if (this.closed) return;
+    this.pc.close();
+    this.handleStreamRemoved();
+};
+
+Peer.prototype.handleRemoteStreamAdded = function (event) {
+    var self = this;
+    if (this.stream) {
+        this.logger.warn('Already have a remote stream');
+    } else {
+        this.stream = event.stream;
+        this.stream.onended = function () {
+            self.end();
+        };
+        this.parent.emit('peerStreamAdded', this);
+    }
+};
+
+Peer.prototype.handleStreamRemoved = function () {
+    this.parent.peers.splice(this.parent.peers.indexOf(this), 1);
+    this.closed = true;
+    this.parent.emit('peerStreamRemoved', this);
+};
+
+Peer.prototype.handleDataChannelAdded = function (channel) {
+    this.channels[channel.label] = channel;
+    this._observeDataChannel(channel);
+};
+
+module.exports = WebRTC;
+
+},{"getusermedia":10,"hark":11,"mediastream-gain":12,"mockconsole":13,"rtcpeerconnection":17,"webrtcsupport":22,"wildemitter":23}],25:[function(_dereq_,module,exports){
+// created by @HenrikJoreteg
+var prefix;
+var isChrome = false;
+var isFirefox = false;
+var ua = window.navigator.userAgent.toLowerCase();
+
+// basic sniffing
+if (ua.indexOf('firefox') !== -1) {
+    prefix = 'moz';
+    isFirefox = true;
+} else if (ua.indexOf('chrome') !== -1) {
+    prefix = 'webkit';
+    isChrome = true;
+}
+
+var PC = window.mozRTCPeerConnection || window.webkitRTCPeerConnection;
+var IceCandidate = window.mozRTCIceCandidate || window.RTCIceCandidate;
+var SessionDescription = window.mozRTCSessionDescription || window.RTCSessionDescription;
+var MediaStream = window.webkitMediaStream || window.MediaStream;
+var screenSharing = window.location.protocol === 'https:' && window.navigator.userAgent.match('Chrome') && parseInt(window.navigator.userAgent.match(/Chrome\/(.*) /)[1], 10) >= 26;
+var AudioContext = window.webkitAudioContext || window.AudioContext;
+
+
+// export support flags and constructors.prototype && PC
+module.exports = {
+    support: !!PC,
+    dataChannel: isChrome || isFirefox || (PC && PC.prototype && PC.prototype.createDataChannel),
+    prefix: prefix,
+    webAudio: !!(AudioContext && AudioContext.prototype.createMediaStreamSource),
+    mediaStream: !!(MediaStream && MediaStream.prototype.removeTrack),
+    screenSharing: !!screenSharing,
+    AudioContext: AudioContext,
+    PeerConnection: PC,
+    SessionDescription: SessionDescription,
+    IceCandidate: IceCandidate
+};
+
+},{}],26:[function(_dereq_,module,exports){
+module.exports=_dereq_(23)
+},{}],27:[function(_dereq_,module,exports){
+var WebRTC = _dereq_('webrtc');
+var WildEmitter = _dereq_('wildemitter');
+var webrtcSupport = _dereq_('webrtcsupport');
+var attachMediaStream = _dereq_('attachmediastream');
+var getScreenMedia = _dereq_('getscreenmedia');
+var mockconsole = _dereq_('mockconsole');
+var io = _dereq_('socket.io-client');
+
+
+function SimpleWebRTC(opts) {
+    var self = this;
+    var options = opts || {};
+    var config = this.config = {
+            url: 'http://signaling.simplewebrtc.com:8888',
+            debug: false,
+            localVideoEl: '',
+            remoteVideosEl: '',
+            enableDataChannels: true,
+            autoRequestMedia: false,
+            autoRemoveVideos: true,
+            adjustPeerVolume: true,
+            peerVolumeWhenSpeaking: 0.25,
+            media: {
+                video: true,
+                audio: true
+            }
+        };
+    var item, connection;
+
+    // We also allow a 'logger' option. It can be any object that implements
+    // log, warn, and error methods.
+    // We log nothing by default, following "the rule of silence":
+    // http://www.linfo.org/rule_of_silence.html
+    this.logger = function () {
+        // we assume that if you're in debug mode and you didn't
+        // pass in a logger, you actually want to log as much as
+        // possible.
+        if (opts.debug) {
+            return opts.logger || console;
+        } else {
+        // or we'll use your logger which should have its own logic
+        // for output. Or we'll return the no-op.
+            return opts.logger || mockconsole;
+        }
+    }();
+
+    // set our config from options
+    for (item in options) {
+        this.config[item] = options[item];
+    }
+
+    // attach detected support for convenience
+    this.capabilities = webrtcSupport;
+
+    // call WildEmitter constructor
+    WildEmitter.call(this);
+
+    // our socket.io connection
+    connection = this.connection = io.connect(this.config.url);
+
+    connection.on('connect', function () {
+        self.emit('connectionReady', connection.socket.sessionid);
+        self.sessionReady = true;
+        self.testReadiness();
+    });
+
+    connection.on('message', function (message) {
+        var peers = self.webrtc.getPeers(message.from, message.roomType);
+        var peer;
+
+        if (message.type === 'offer') {
+            if (peers.length) {
+                peer = peers[0];
+            } else {
+                peer = self.webrtc.createPeer({
+                    id: message.from,
+                    type: message.roomType,
+                    enableDataChannels: self.config.enableDataChannels && message.roomType !== 'screen',
+                    sharemyscreen: message.roomType === 'screen' && !message.broadcaster,
+                    broadcaster: message.roomType === 'screen' && !message.broadcaster ? self.connection.socket.sessionid : null
+                });
+            }
+            peer.handleMessage(message);
+        } else if (peers.length) {
+            peers.forEach(function (peer) {
+                peer.handleMessage(message);
+            });
+        }
+    });
+
+    connection.on('remove', function (room) {
+        if (room.id !== self.connection.socket.sessionid) {
+            self.webrtc.removePeers(room.id, room.type);
+        }
+    });
+
+    // instantiate our main WebRTC helper
+    // using same logger from logic here
+    opts.logger = this.logger;
+    opts.debug = false;
+    this.webrtc = new WebRTC(opts);
+
+    // attach a few methods from underlying lib to simple.
+    ['mute', 'unmute', 'pauseVideo', 'resumeVideo', 'pause', 'resume', 'sendToAll', 'sendDirectlyToAll'].forEach(function (method) {
+        self[method] = self.webrtc[method].bind(self.webrtc);
+    });
+
+    // proxy events from WebRTC
+    this.webrtc.on('*', function () {
+        self.emit.apply(self, arguments);
+    });
+
+    // log all events in debug mode
+    if (config.debug) {
+        this.on('*', this.logger.log.bind(this.logger, 'SimpleWebRTC event:'));
+    }
+
+    // check for readiness
+    this.webrtc.on('localStream', function () {
+        self.testReadiness();
+    });
+
+    this.webrtc.on('message', function (payload) {
+        self.connection.emit('message', payload);
+    });
+
+    this.webrtc.on('peerStreamAdded', this.handlePeerStreamAdded.bind(this));
+    this.webrtc.on('peerStreamRemoved', this.handlePeerStreamRemoved.bind(this));
+
+    // echo cancellation attempts
+    if (this.config.adjustPeerVolume) {
+        this.webrtc.on('speaking', this.setVolumeForAll.bind(this, this.config.peerVolumeWhenSpeaking));
+        this.webrtc.on('stoppedSpeaking', this.setVolumeForAll.bind(this, 1));
+    }
+
+    connection.on('stunservers', function (args) {
+        // resets/overrides the config
+        self.webrtc.config.peerConnectionConfig.iceServers = args;
+        self.emit('stunservers', args);
+    });
+    connection.on('turnservers', function (args) {
+        // appends to the config
+        self.webrtc.config.peerConnectionConfig.iceServers = self.webrtc.config.peerConnectionConfig.iceServers.concat(args);
+        self.emit('turnservers', args);
+    });
+
+    // sending mute/unmute to all peers
+    this.webrtc.on('audioOn', function () {
+        self.webrtc.sendToAll('unmute', {name: 'audio'});
+    });
+    this.webrtc.on('audioOff', function () {
+        self.webrtc.sendToAll('mute', {name: 'audio'});
+    });
+    this.webrtc.on('videoOn', function () {
+        self.webrtc.sendToAll('unmute', {name: 'video'});
+    });
+    this.webrtc.on('videoOff', function () {
+        self.webrtc.sendToAll('mute', {name: 'video'});
+    });
+
+    if (this.config.autoRequestMedia) this.startLocalVideo();
+}
+
+
+SimpleWebRTC.prototype = Object.create(WildEmitter.prototype, {
+    constructor: {
+        value: SimpleWebRTC
+    }
+});
+
+SimpleWebRTC.prototype.leaveRoom = function () {
+    if (this.roomName) {
+        this.connection.emit('leave');
+        this.webrtc.peers.forEach(function (peer) {
+            peer.end();
+        });
+        if (this.getLocalScreen()) {
+            this.stopScreenShare();
+        }
+        this.emit('leftRoom', this.roomName);
+        this.roomName = undefined;
+    }
+};
+
+SimpleWebRTC.prototype.handlePeerStreamAdded = function (peer) {
+    var self = this;
+    var container = this.getRemoteVideoContainer();
+    var video = attachMediaStream(peer.stream);
+
+    // store video element as part of peer for easy removal
+    peer.videoEl = video;
+    video.id = this.getDomId(peer);
+
+    if (container) container.appendChild(video);
+
+    this.emit('videoAdded', video, peer);
+
+    // send our mute status to new peer if we're muted
+    // currently called with a small delay because it arrives before
+    // the video element is created otherwise (which happens after
+    // the async setRemoteDescription-createAnswer)
+    window.setTimeout(function () {
+        var muted = false;
+        self.webrtc.localStream.getAudioTracks().forEach(function (track) {
+            muted = !track.enabled;
+        });
+        if (muted) {
+            peer.send('mute', {name: 'audio'});
+        }
+
+        muted = false;
+        self.webrtc.localStream.getVideoTracks().forEach(function (track) {
+            muted = !track.enabled;
+        });
+        if (muted) {
+            peer.send('mute', {name: 'video'});
+        }
+    }, 250);
+};
+
+SimpleWebRTC.prototype.handlePeerStreamRemoved = function (peer) {
+    var container = this.getRemoteVideoContainer();
+    var videoEl = peer.videoEl;
+    if (this.config.autoRemoveVideos && container && videoEl) {
+        container.removeChild(videoEl);
+    }
+    if (videoEl) this.emit('videoRemoved', videoEl, peer);
+};
+
+SimpleWebRTC.prototype.getDomId = function (peer) {
+    return [peer.id, peer.type, peer.broadcaster ? 'broadcasting' : 'incoming'].join('_');
+};
+
+// set volume on video tag for all peers takse a value between 0 and 1
+SimpleWebRTC.prototype.setVolumeForAll = function (volume) {
+    this.webrtc.peers.forEach(function (peer) {
+        if (peer.videoEl) peer.videoEl.volume = volume;
+    });
+};
+
+SimpleWebRTC.prototype.joinRoom = function (name, cb) {
+    var self = this;
+    this.roomName = name;
+    this.connection.emit('join', name, function (err, roomDescription) {
+        if (err) {
+            self.emit('error', err);
+        } else {
+            var id,
+                client,
+                type,
+                peer;
+            for (id in roomDescription.clients) {
+                client = roomDescription.clients[id];
+                for (type in client) {
+                    if (client[type]) {
+                        peer = self.webrtc.createPeer({
+                            id: id,
+                            type: type,
+                            enableDataChannels: self.config.enableDataChannels && type !== 'screen',
+                            receiveMedia: {
+                                mandatory: {
+                                    OfferToReceiveAudio: type !== 'screen',
+                                    OfferToReceiveVideo: true
+                                }
+                            }
+                        });
+                        peer.start();
+                    }
+                }
+            }
+        }
+
+        if (cb) cb(err, roomDescription);
+        self.emit('joinedRoom', name);
+    });
+};
+
+SimpleWebRTC.prototype.getEl = function (idOrEl) {
+    if (typeof idOrEl === 'string') {
+        return document.getElementById(idOrEl);
+    } else {
+        return idOrEl;
+    }
+};
+
+SimpleWebRTC.prototype.startLocalVideo = function () {
+    var self = this;
+    this.webrtc.startLocalMedia(this.config.media, function (err, stream) {
+        if (err) {
+            self.emit('localMediaError', err);
+        } else {
+            attachMediaStream(stream, self.getLocalVideoContainer(), {muted: true, mirror: true});
+        }
+    });
+};
+
+SimpleWebRTC.prototype.stopLocalVideo = function () {
+    this.webrtc.stopLocalMedia();
+};
+
+// this accepts either element ID or element
+// and either the video tag itself or a container
+// that will be used to put the video tag into.
+SimpleWebRTC.prototype.getLocalVideoContainer = function () {
+    var el = this.getEl(this.config.localVideoEl);
+    if (el && el.tagName === 'VIDEO') {
+        el.oncontextmenu = function () { return false; };
+        return el;
+    } else if (el) {
+        var video = document.createElement('video');
+        video.oncontextmenu = function () { return false; };
+        el.appendChild(video);
+        return video;
+    } else {
+        return;
+    }
+};
+
+SimpleWebRTC.prototype.getRemoteVideoContainer = function () {
+    return this.getEl(this.config.remoteVideosEl);
+};
+
+SimpleWebRTC.prototype.shareScreen = function (cb) {
+    var self = this,
+        peer;
+    getScreenMedia(function (err, stream) {
+        var item,
+            el = document.createElement('video'),
+            container = self.getRemoteVideoContainer();
+
+        el.oncontextmenu = function () { return false; };
+        if (!err) {
+            self.webrtc.localScreen = stream;
+            el.id = 'localScreen';
+            attachMediaStream(stream, el);
+            if (container) {
+                container.appendChild(el);
+            }
+
+            // TODO: might need to migrate to the video tracks onended
+            stream.onended = function () {
+                self.emit('localScreenRemoved', el);
+                self.stopScreenShare();
+            };
+
+            self.emit('localScreenAdded', el);
+            self.connection.emit('shareScreen');
+            self.webrtc.peers.forEach(function (existingPeer) {
+                var peer;
+                if (existingPeer.type === 'video') {
+                    peer = self.webrtc.createPeer({
+                        id: existingPeer.id,
+                        type: 'screen',
+                        sharemyscreen: true,
+                        enableDataChannels: false,
+                        receiveMedia: {
+                            mandatory: {
+                                OfferToReceiveAudio: false,
+                                OfferToReceiveVideo: false
+                            }
+                        },
+                        broadcaster: self.connection.socket.sessionid,
+                    });
+                    peer.start();
+                }
+            });
+        } else {
+            err.media = 'screen';
+            self.emit('localMediaError', err);
+        }
+
+        // enable the callback
+        if (cb) cb(err, stream);
+    });
+};
+
+SimpleWebRTC.prototype.getLocalScreen = function () {
+    return this.webrtc.localScreen;
+};
+
+SimpleWebRTC.prototype.stopScreenShare = function () {
+    this.connection.emit('unshareScreen');
+    var videoEl = document.getElementById('localScreen');
+    var container = this.getRemoteVideoContainer();
+    var stream = this.getLocalScreen();
+
+    if (this.config.autoRemoveVideos && container && videoEl) {
+        container.removeChild(videoEl);
+    }
+
+    // a hack to emit the event the removes the video
+    // element that we want
+    if (videoEl) this.emit('videoRemoved', videoEl);
+    if (stream) stream.stop();
+    this.webrtc.peers.forEach(function (peer) {
+        if (peer.broadcaster) {
+            peer.end();
+        }
+    });
+    delete this.webrtc.localScreen;
+};
+
+SimpleWebRTC.prototype.testReadiness = function () {
+    var self = this;
+    if (this.webrtc.localStream && this.sessionReady) {
+        self.emit('readyToCall', self.connection.socket.sessionid);
+    }
+};
+
+SimpleWebRTC.prototype.createRoom = function (name, cb) {
+    if (arguments.length === 2) {
+        this.connection.emit('create', name, cb);
+    } else {
+        this.connection.emit('create', name);
+    }
+};
+
+SimpleWebRTC.prototype.sendFile = function () {
+    if (!webrtcSupport.dataChannel) {
+        return this.emit('error', new Error('DataChannelNotSupported'));
+    }
+
+};
+
+module.exports = SimpleWebRTC;
+
+},{"attachmediastream":1,"getscreenmedia":6,"mockconsole":8,"socket.io-client":9,"webrtc":24,"webrtcsupport":25,"wildemitter":26}]},{},[27])
+(27)
+});
