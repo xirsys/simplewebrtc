@@ -40,6 +40,9 @@
         <script src="socket.io.js"></script>
         <script src="simplewebrtc.bundle.js"></script>
         <script>
+            // Grab the room from the URL
+            var room = location.search && location.search.split('?')[1];
+            
             // This object will take in an array of XirSys STUN / TURN servers
             // and override the original peerConnectionConfig object
             var peerConnectionConfig;
@@ -53,7 +56,7 @@
                     secret: "< Your secret API token >",
                     domain: "< www.yourdomain.com >",
                     application: "default",
-                    room: "default",
+                    room: room,
                     secure: 1
                 },
                 success: function (data, status) {
@@ -64,9 +67,6 @@
                 async: false
             });
             
-            // Grab the room from the URL
-            var room = location.search && location.search.split('?')[1];
-
             // Create our WebRTC connection
             var webrtc = new SimpleWebRTC({
                 // The DOM element that will hold "our" video
