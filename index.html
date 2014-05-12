@@ -40,6 +40,30 @@
         <script src="socket.io.js"></script>
         <script src="simplewebrtc.bundle.js"></script>
         <script>
+            // This object will take in an array of XirSys STUN / TURN servers
+            // and override the original peerConnectionConfig object
+            var peerConnectionConfig;
+            
+            $.ajax({
+                type: "POST",
+                dataType: "json",
+                url: "https://api.xirsys.com/getIceServers",
+                data: {
+                    ident: "< Your username >",
+                    secret: "< Your secret API token >",
+                    domain: "< www.yourdomain.com >",
+                    application: "default",
+                    room: "default",
+                    secure: 1
+                },
+                success: function (data, status) {
+                    // data.d is where the iceServers object lives
+                    peerConnectionConfig = data.d;
+                    console.log(peerConnectionConfig);
+                },
+                async: false
+            });
+            
             // grab the room from the URL
             var room = location.search && location.search.split('?')[1];
 
@@ -53,7 +77,9 @@
                 autoRequestMedia: true,
                 debug: false,
                 detectSpeakingEvents: true,
-                autoAdjustMic: false
+                autoAdjustMic: false,
+                // Add the new peerConnectionConfig object
+                peerConnectionConfig: peerConnectionConfig
             });
 
             // when it's ready, join if we got a room from the URL
