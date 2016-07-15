@@ -24,6 +24,9 @@
                 bottom: 0px;
                 background-color: #12acef;
             }
+            /*body{
+                display: none;
+            }*/
         </style>
         <button id="screenShareButton"></button>
         <p id="subTitle"></p>
@@ -37,157 +40,186 @@
         </div>
         <div id="remotes"></div>
         <script src="//ajax.googleapis.com/ajax/libs/jquery/1.9.0/jquery.min.js"></script>
-        <script src="socket.io.js"></script>
         <script src="simplewebrtc.bundle.js"></script>
         <script>
-            // Grab the room from the URL
+            // grab the room from the URL
             var room = location.search && location.search.split('?')[1];
-            
-            // This object will take in an array of XirSys STUN / TURN servers
-            // and override the original peerConnectionConfig object
-            var peerConnectionConfig;
-            
-            $.ajax({
-                type: "POST",
-                dataType: "json",
-                url: "https://api.xirsys.com/getIceServers",
-                data: {
-                    ident: "< Your username >",
-                    secret: "< Your secret API token >",
-                    domain: "< www.yourdomain.com >",
-                    application: "default",
-                    room: room,
-                    secure: 1
-                },
-                success: function (data, status) {
+
+			// This object will take in an array of XirSys STUN / TURN servers
+			// and override the original peerConnectionConfig object
+			var peerConnectionConfig;
+
+            var x_data = {
+                        ident: "sherry"
+                        , secret: "ed50634c-57a5-4ad8-8d11-acae5786bdfb"
+                        , domain: "my.invent.com"
+                        , application: "test"
+                        , secure: 1
+                    };
+                //if no room defined default into 'default' room
+                x_data.room = room != null && room.length > 0 ? room : 'default';
+
+			$.ajax({
+				url: "https://service.xirsys.com/ice",
+				data: x_data,
+				success: function(data, status){
                     // data.d is where the iceServers object lives
                     peerConnectionConfig = data.d;
-                    console.log(peerConnectionConfig);
-                },
-                async: false
-            });
-            
-            // Create our WebRTC connection
-            var webrtc = new SimpleWebRTC({
-                // The DOM element that will hold "our" video
-                localVideoEl: 'localVideo',
-                // The DOM element that will hold remote videos
-                remoteVideosEl: '',
-                // Immediately ask for camera access
-                autoRequestMedia: true,
-                debug: false,
-                detectSpeakingEvents: true,
-                autoAdjustMic: false,
-                // Add the new peerConnectionConfig object
-                peerConnectionConfig: peerConnectionConfig
-            });
-
-            // when it's ready, join if we got a room from the URL
-            webrtc.on('readyToCall', function () {
-                // you can name it anything
-                if (room) webrtc.joinRoom(room);
-            });
-
-            function showVolume(el, volume) {
-                if (!el) return;
-                if (volume < -45) { // vary between -45 and -20
-                    el.style.height = '0px';
-                } else if (volume > -20) {
-                    el.style.height = '100%';
-                } else {
-                    el.style.height = '' + Math.floor((volume + 100) * 100 / 25 - 220) + '%';
+                    if(peerConnectionConfig !=null){
+                        start(peerConnectionConfig);
+                    }else{
+                        console.log('/ice error - ', data);
+                    }
                 }
-            }
-            webrtc.on('channelMessage', function (peer, label, data) {
-                if (data.type == 'volume') {
-                    showVolume(document.getElementById('volume_' + peer.id), data.volume);
-                }
-            });
-            webrtc.on('videoAdded', function (video, peer) {
-                console.log('video added', peer);
-                var remotes = document.getElementById('remotes');
-                if (remotes) {
-                    var d = document.createElement('div');
-                    d.className = 'videoContainer';
-                    d.id = 'container_' + webrtc.getDomId(peer);
-                    d.appendChild(video);
-                    var vol = document.createElement('div');
-                    vol.id = 'volume_' + peer.id;
-                    vol.className = 'volume_bar';
-                    video.onclick = function () {
-                        video.style.width = video.videoWidth + 'px';
-                        video.style.height = video.videoHeight + 'px';
-                    };
-                    d.appendChild(vol);
-                    remotes.appendChild(d);
-                }
-            });
-            webrtc.on('videoRemoved', function (video, peer) {
-                console.log('video removed ', peer);
-                var remotes = document.getElementById('remotes');
-                var el = document.getElementById('container_' + webrtc.getDomId(peer));
-                if (remotes && el) {
-                    remotes.removeChild(el);
-                }
-            });
-            webrtc.on('volumeChange', function (volume, treshold) {
-                //console.log('own volume', volume);
-                showVolume(document.getElementById('localVolume'), volume);
-            });
+			});	
+            //success callback handler which should provide peerConnectionConfig data
+            function start(peerConnectionConfig){
+                // Create our WebRTC connection
+                var webrtc = new SimpleWebRTC({
+                    // The DOM element that will hold "our" video
+                    localVideoEl: 'localVideo',
+                    // The DOM element that will hold remote videos
+                    remoteVideosEl: '',
+                    // Immediately ask for camera access
+                    autoRequestMedia: true,
+                    debug: false,
+                    detectSpeakingEvents: true,
+                    autoAdjustMic: false,
+                    // Add the new peerConnectionConfig object
+                    peerConnectionConfig: peerConnectionConfig
+                });                     
 
-            // Since we use this twice we put it here
-            function setRoom(name) {
-                $('form').remove();
-                $('h1').text(name);
-                $('#subTitle').text('Link to join: ' + location.href);
-                $('body').addClass('active');
-            }
-
-            if (room) {
-                setRoom(room);
-            } else {
-                $('form').submit(function () {
-                    var val = $('#sessionInput').val().toLowerCase().replace(/\s/g, '-').replace(/[^A-Za-z0-9_\-]/g, '');
-                    webrtc.createRoom(val, function (err, name) {
-                        console.log(' create room cb', arguments);
-                    
-                        var newUrl = location.pathname + '?' + name;
-                        if (!err) {
-                            history.replaceState({foo: 'bar'}, null, newUrl);
-                            setRoom(name);
-                        } else {
-                            console.log(err);
-                        }
-                    });
-                    return false;          
+                // when it's ready, join if we got a room from the URL
+                webrtc.on('readyToCall', function () {
+                    // you can name it anything
+                    if (room) webrtc.joinRoom(room);
                 });
-            }
 
-            var button = $('#screenShareButton'),
-                setButton = function (bool) {
-                    button.text(bool ? 'share screen' : 'stop sharing');
-                };
-            webrtc.on('localScreenRemoved', function () {
-                setButton(true);
-            });
-
-            setButton(true);
-
-            button.click(function () {
-                if (webrtc.getLocalScreen()) {
-                    webrtc.stopScreenShare();
-                    setButton(true);
-                } else {
-                    webrtc.shareScreen(function (err) {
-                        if (err) {
-                            setButton(true);
-                        } else {
-                            setButton(false);
-                        }
-                    });
-                    
+                function showVolume(el, volume) {
+                    if (!el) return;
+                    if (volume < -45) { // vary between -45 and -20
+                        el.style.height = '0px';
+                    } else if (volume > -20) {
+                        el.style.height = '100%';
+                    } else {
+                        el.style.height = '' + Math.floor((volume + 100) * 100 / 25 - 220) + '%';
+                    }
                 }
-            });
+                webrtc.on('channelMessage', function (peer, label, data) {
+                    if (data.type == 'volume') {
+                        showVolume(document.getElementById('volume_' + peer.id), data.volume);
+                    }
+                });
+                webrtc.on('videoAdded', function (video, peer) {
+                    console.log('video added', peer);
+                    var remotes = document.getElementById('remotes');
+                    if (remotes) {
+                        var d = document.createElement('div');
+                        d.className = 'videoContainer';
+                        d.id = 'container_' + webrtc.getDomId(peer);
+                        d.appendChild(video);
+                        var vol = document.createElement('div');
+                        vol.id = 'volume_' + peer.id;
+                        vol.className = 'volume_bar';
+                        video.onclick = function () {
+                            video.style.width = video.videoWidth + 'px';
+                            video.style.height = video.videoHeight + 'px';
+                        };
+                        d.appendChild(vol);
+                        remotes.appendChild(d);
+                    }
+                });
+                webrtc.on('videoRemoved', function (video, peer) {
+                    console.log('video removed ', peer);
+                    var remotes = document.getElementById('remotes');
+                    var el = document.getElementById('container_' + webrtc.getDomId(peer));
+                    if (remotes && el) {
+                        remotes.removeChild(el);
+                    }
+                });
+                webrtc.on('volumeChange', function (volume, treshold) {
+                    //console.log('own volume', volume);
+                    showVolume(document.getElementById('localVolume'), volume);
+                });
+                /*webrtc.createRoom = function(room, cb){
+                    console.log('createRoom', room);
+                }*/
+
+                // Since we use this twice we put it here
+                function setRoom(name) {
+                    $('form').remove();
+                    $('h1').text(name);
+                    $('#subTitle').text('Link to join: ' + location.href);
+                    $('body').addClass('active');
+                }
+
+                if (room) {
+                    setRoom(room);
+                } else {
+                    $('form').submit(function () {
+                        var val = $('#sessionInput').val().toLowerCase().replace(/\s/g, '-').replace(/[^A-Za-z0-9_\-]/g, '');                   
+                        
+                        webrtc.createRoom(val, function (err, name) {
+                            console.log(' create room cb', arguments);
+                            if (!err) {
+                                //
+                                var d = x_data;
+                                    d.room = name;
+                                $.ajax({
+                                    url: "https://service.xirsys.com/room",
+                                    type: "POST",
+                                    data: d,
+                                    success: function(data, status){
+                                        if(data.d != null){
+                                            var newUrl = location.pathname + '?' + name;
+                                            history.replaceState({foo: 'bar'}, null, newUrl);
+                                            setRoom(name);
+                                        }else{
+                                            console.log('/room err - ', data);
+                                            $('#title').text();
+                                        }
+                                    }
+                                });
+                            }else{
+                                console.log(err);
+                            } 
+                        });
+                        
+                        return false;          
+                    });
+                }
+                
+                webrtc.on('localScreenStopped', function () {
+                    setButton(true);
+                });
+
+                var button = $('#screenShareButton'),
+                    setButton = function (bool) {
+                        button.text(bool ? 'share screen' : 'stop sharing');
+                    };
+                
+                if (!webrtc.capabilities.screenSharing) {
+                    button.attr('disabled', 'disabled');                    
+                }
+
+                setButton(true);
+
+                button.click(function () {
+                    if (webrtc.getLocalScreen()) {
+                        webrtc.stopScreenShare();
+                        setButton(true);
+                    } else {
+                        webrtc.shareScreen(function (err) {
+                            if (err) {
+                                setButton(true);
+                            } else {
+                                setButton(false);
+                            }
+                        });
+                        
+                    }
+                });
+            }			
         </script>
     </body>
 </html>

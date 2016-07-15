@@ -1,6 +1,6 @@
 {
   "name": "simplewebrtc",
-  "version": "1.7.6",
+  "version": "2.2.0",
   "repository": {
     "type": "git",
     "url": "git@github.com:henrikjoreteg/SimpleWebRTC.git"
@@ -8,22 +8,37 @@
   "main": "./simplewebrtc.js",
   "description": "World's easiest webrtc",
   "dependencies": {
-    "webrtcsupport": "0.7.3",
-    "wildemitter": "0.0.5",
-    "getscreenmedia": "1.0.x",
-    "socket.io-client": "0.9.16",
-    "attachmediastream": "1.0.1",
-    "webrtc": "1.6.x",
+    "filetransfer": "^2.0.4",
+    "localmedia": "^2.1.0",
+    "rtcpeerconnection": "^5.1.1",
+    "webrtcsupport": "^2.2.0",
+    "wildemitter": "1.x",
+    "socket.io-client": "1.3.7",
+    "attachmediastream": "^1.4.1",
     "mockconsole": "0.0.1"
   },
   "devDependencies": {
-    "express": "3.x.x",
-    "browserify": "2.22.0",
-    "precommit-hook": "0.3.x",
-    "request": "",
-    "uglify-js": "2.3.6"
+    "browserify": "13.0.1",
+    "chromedriver": "^2.16.0",
+    "express": "4.x.x",
+    "precommit-hook": "3.0.x",
+    "request": "^2.72.0",
+    "selenium-webdriver": "^2.53.1",
+    "tape": "^4.0.0",
+    "testling": "^1.7.1",
+    "travis-multirunner": "^3.0.0",
+    "uglify-js": "2.6.2"
   },
+  "license": "MIT",
   "scripts": {
-    "updateLatest": "./scripts/updateLatest.sh"
-  }
+    "test-travis": "test/run-selenium",
+    "updateLatest": "./scripts/updateLatest.sh",
+    "lint": "jshint .",
+    "validate": "npm ls"
+  },
+  "pre-commit": [
+    "lint",
+    "validate",
+    "test"
+  ]
 }

@@ -1,17 +1,13 @@
-var bundle = require('browserify')(),
+var bundle = require('browserify')({standalone: 'SimpleWebRTC'}),
     fs = require('fs'),
     request = require('request'),
     uglify = require('uglify-js');
 
 bundle.add('./simplewebrtc');
-bundle.bundle({standalone: 'SimpleWebRTC'}, function (err, source) {
+bundle.bundle(function (err, source) {
     if (err) console.error(err);
     fs.writeFileSync('simplewebrtc.bundle.js', source);
-    request.get('http://signaling.simplewebrtc.com:8888/socket.io/socket.io.js', function (err, res, body) {
-        if (!err && body && body.length) {
-            fs.writeFile('latest.js', uglify.minify(source + body, {fromString: true}).code, function (err) {
-                if (err) throw err;
-            });
-        }
+    fs.writeFile('latest-v2.js', uglify.minify(source.toString('utf8'), {fromString: true}).code, function (err) {
+      if (err) throw err;
     });
 });
